@@ -46,6 +46,7 @@ import com.vineyard.aivideostudio.media.audio.AudioExtractor
 import com.vineyard.aivideostudio.media.audio.PcmToM4aConverter
 import com.vineyard.aivideostudio.media.timeline.TimelineMapper
 import com.vineyard.aivideostudio.media.transformer.Media3TransformerEngine
+import com.vineyard.aivideostudio.media.video.OcrAnchorCalibrator
 import com.vineyard.aivideostudio.media.video.VideoMetadataReader
 import com.vineyard.aivideostudio.processing.logger.LogSeverity
 import com.vineyard.aivideostudio.processing.logger.ProcessingLogger
@@ -788,9 +789,29 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (With Universal Resolution Binding)
+        // 7. FINAL PRODUCTION EXPORT (With Universal Resolution Binding & OCR Magnetic Auto-Fix)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
+
+        // Auto-Fix: Calibrate misplaced tracking indicators against actual on-screen text before export
+        val calibratedTrackingIndicators = try {
+            OcrAnchorCalibrator.calibrateIndicators(
+                context = context,
+                videoUri = Uri.parse(currentVideoUri),
+                indicators = remappedTrackingIndicators,
+                videoWidth = project.metadata.width,
+                videoHeight = project.metadata.height
+            )
+        } catch (e: Exception) {
+            logger.log(
+                projectId,
+                PipelineStatus.EXPORTING,
+                "OCR Anchor auto-fix skipped: ${e.message}",
+                LogSeverity.WARNING
+            )
+            remappedTrackingIndicators
+        }
+
         logger.log(
             projectId,
             PipelineStatus.EXPORTING,
@@ -811,7 +832,7 @@ class VideoProcessingPipeline(
             blurSpecs = remappedBlurSpecs,
             replacementOverlays = remappedReplacementOverlays,
             colorGrade = colorGradeSpec,
-            trackingIndicators = remappedTrackingIndicators,
+            trackingIndicators = calibratedTrackingIndicators,
             textCards = remappedTextCards,
             videoWidth = project.metadata.width,
             videoHeight = project.metadata.height
