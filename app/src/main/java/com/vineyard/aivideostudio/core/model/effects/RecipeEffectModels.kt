@@ -78,7 +78,9 @@ data class BlurSpec(
     @Json(name = "shape") val shape: BlurShape = BlurShape.RECTANGLE,
     @Json(name = "type") val type: BlurType = BlurType.GAUSSIAN,
     @Json(name = "bounds") val bounds: NormalizedBounds,
-    @Json(name = "intensity") val intensity: Float = 15.0f // 1.0 to 50.0 radius / pixel size
+    @Json(name = "intensity") val intensity: Float = 15.0f, // 1.0 to 50.0 radius / pixel size
+    @Json(name = "target_type") val targetType: String? = null, // "face", "object", "text"
+    @Json(name = "object_class") val objectClass: String? = null // e.g. "clothing", "person"
 )
 
 @JsonClass(generateAdapter = true)
@@ -175,5 +177,7 @@ data class TrackingIndicatorSpec(
     @Json(name = "dim_background_opacity") val dimBackgroundOpacity: Float = 0.0f, // 0.0 = none, 0.6 = darkens background for spotlight
     @Json(name = "keyframes") val keyframes: List<TrackingKeyframe> = emptyList(),
     @Json(name = "tracking_mode") val trackingMode: String = "auto", // "static", "keyframes", or "auto"
-    @Json(name = "target_text") val targetText: String? = null      // Target text query for on-device OCR snap
+    @Json(name = "target_text") val targetText: String? = null,      // Target text query for on-device OCR snap
+    @Json(name = "target_type") val targetType: String? = null,      // "face", "object", "text"
+    @Json(name = "object_class") val objectClass: String? = null     // e.g. "clothing", "person"
 )
