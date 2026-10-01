@@ -168,7 +168,11 @@ data class RecipeBlurDto(
     @Json(name = "shape") val shape: String = "rectangle", // "rectangle", "circle", "full_frame"
     @Json(name = "type") val type: String = "gaussian",    // "gaussian", "mosaic", "privacy_box"
     @Json(name = "bounds") val bounds: NormalizedBoundsDto,
-    @Json(name = "intensity") val intensity: Float = 15.0f
+    @Json(name = "intensity") val intensity: Float = 15.0f,
+    @Json(name = "targetType") val targetType: String? = null,          // "face", "object", "text"
+    @Json(name = "target_type") val targetTypeSnake: String? = null,
+    @Json(name = "objectClass") val objectClass: String? = null,        // e.g. "clothing", "person"
+    @Json(name = "object_class") val objectClassSnake: String? = null
 ) {
     fun toBlurSpec(): BlurSpec {
         val blurShape = when (shape.lowercase()) {
@@ -181,13 +185,18 @@ data class RecipeBlurDto(
             "privacy_box" -> BlurType.PRIVACY_BOX
             else -> BlurType.GAUSSIAN
         }
+        val resolvedTargetType = targetType ?: targetTypeSnake
+        val resolvedObjectClass = objectClass ?: objectClassSnake
+
         return BlurSpec(
             startTimeMs = startTimeMs,
             endTimeMs = endTimeMs,
             shape = blurShape,
             type = blurType,
             bounds = bounds.toNormalizedBounds(),
-            intensity = intensity
+            intensity = intensity,
+            targetType = resolvedTargetType,
+            objectClass = resolvedObjectClass
         )
     }
 }
@@ -284,6 +293,10 @@ data class RecipeTrackingDto(
     @Json(name = "color_hex") val colorHex: String = "#FF0000",
     @Json(name = "stroke_width_px") val strokeWidthPx: Float = 6.0f,
     @Json(name = "label") val label: String? = null,
+    @Json(name = "targetType") val targetType: String? = null,          // "face", "object", "text"
+    @Json(name = "target_type") val targetTypeSnake: String? = null,
+    @Json(name = "objectClass") val objectClass: String? = null,        // e.g. "clothing", "person"
+    @Json(name = "object_class") val objectClassSnake: String? = null,
     @Json(name = "targetText") val targetText: String? = null,          // OCR search query (e.g. "Grounding with Google Search")
     @Json(name = "target_text") val targetTextSnake: String? = null,    // snake_case support
     @Json(name = "trackingMode") val trackingMode: String? = null,      // "static", "keyframes", or "auto"
@@ -311,6 +324,8 @@ data class RecipeTrackingDto(
         }
         val resolvedMode = trackingMode ?: trackingModeSnake ?: "auto"
         val resolvedTargetText = targetText ?: targetTextSnake
+        val resolvedTargetType = targetType ?: targetTypeSnake
+        val resolvedObjectClass = objectClass ?: objectClassSnake
 
         return TrackingIndicatorSpec(
             id = id ?: "track_ind_${index}_${System.currentTimeMillis()}",
@@ -325,7 +340,9 @@ data class RecipeTrackingDto(
             dimBackgroundOpacity = dimBackgroundOpacity.coerceIn(0.0f, 1.0f),
             keyframes = keyframes.map { it.toTrackingKeyframe() },
             trackingMode = resolvedMode,
-            targetText = resolvedTargetText
+            targetText = resolvedTargetText,
+            targetType = resolvedTargetType,
+            objectClass = resolvedObjectClass
         )
     }
 }
