@@ -80,7 +80,7 @@ class AppContainer(private val context: Context) {
     val ttsEngine = GeminiTtsEngine(context, geminiApiService, geminiPreferences, modelRepository)
 
     // On-Device Script-Mode Object & Face Calibrator
-    val objectAnchorCalibrator = ObjectAnchorCalibrator(context)
+    val objectAnchorCalibrator = ObjectAnchorCalibrator(context, logger)
 
     // Hardware AAC Encoder for Live PCM Audio Streams
     val pcmToM4aConverter = PcmToM4aConverter(
