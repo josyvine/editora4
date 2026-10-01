@@ -584,7 +584,7 @@ class VideoProcessingPipeline(
         logger.log(
             projectId,
             PipelineStatus.SOURCE_ANALYSIS,
-            "Master Recipe Configuration: AudioOnly=${recipe.audioOnlyMode} | SpeedRamps=${speedSpecs.size} | Blurs=${blurSpecs.size} | Overlays=${replacementSpecs.size} | Cards=${cardSpecs.size} | ColorGrade=${colorGradeSpec?.preset ?: "None"}",
+            "Master Recipe Configuration: AudioOnly=${recipe.audioOnlyMode} | SpeedRamps=${speedSpecs.size} | Blurs=${blurSpecs.size} | Highlights=${trackingSpecs.size} | Overlays=${replacementSpecs.size} | Cards=${cardSpecs.size} | ColorGrade=${colorGradeSpec?.preset ?: "None"}",
             LogSeverity.INFO
         )
 
@@ -703,7 +703,7 @@ class VideoProcessingPipeline(
         logger.log(
             projectId,
             PipelineStatus.CAPTION_ANALYSIS,
-            "Automated Remapping: Translated ${remappedCommentarySegments.size} voice cues, ${remappedCaptions.size} captions, ${remappedBlurSpecs.size} blurs, ${remappedReplacementOverlays.size} overlays, and ${remappedTextCards.size} text cards",
+            "Automated Remapping: Translated ${remappedCommentarySegments.size} voice cues, ${remappedCaptions.size} captions, ${remappedBlurSpecs.size} blurs, ${remappedTrackingIndicators.size} highlights, ${remappedReplacementOverlays.size} overlays, and ${remappedTextCards.size} text cards",
             LogSeverity.INFO
         )
 
@@ -789,18 +789,20 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (With Universal Resolution Binding & OCR Magnetic Auto-Fix)
+        // 7. FINAL PRODUCTION EXPORT (With Universal Resolution Binding & Real-Time OCR Telemetry)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
-        // Auto-Fix: Calibrate misplaced tracking indicators against actual on-screen text before export
+        // Auto-Fix: Calibrate misplaced tracking indicators against actual on-screen text before export with live telemetry
         val calibratedTrackingIndicators = try {
             OcrAnchorCalibrator.calibrateIndicators(
                 context = context,
                 videoUri = Uri.parse(currentVideoUri),
                 indicators = remappedTrackingIndicators,
                 videoWidth = project.metadata.width,
-                videoHeight = project.metadata.height
+                videoHeight = project.metadata.height,
+                logger = logger,
+                projectId = projectId
             )
         } catch (e: Exception) {
             logger.log(
@@ -815,7 +817,7 @@ class VideoProcessingPipeline(
         logger.log(
             projectId,
             PipelineStatus.EXPORTING,
-            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | PurgeSourceAudio=true",
+            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${calibratedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | PurgeSourceAudio=true",
             LogSeverity.INFO
         )
 
