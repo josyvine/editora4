@@ -129,6 +129,10 @@ dependencies {
   // Google ML Kit On-Device Text Recognition for UI Magnetic Snapping
   implementation("com.google.mlkit:text-recognition:16.0.1")
 
+  // Google ML Kit On-Device Face & Object Detection for Script-Mode Auto-Fix
+  implementation("com.google.mlkit:face-detection:16.1.7")
+  implementation("com.google.mlkit:object-detection:17.0.2")
+
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
