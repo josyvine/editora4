@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Editora</string>
+    <string name="app_tagline">AI-Directed Video Production Studio</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_projects">Projects</string>
+    <string name="nav_create">Create</string>
+    <string name="nav_activity">Activity</string>
+    <string name="nav_settings">Settings</string>
+</resources>
