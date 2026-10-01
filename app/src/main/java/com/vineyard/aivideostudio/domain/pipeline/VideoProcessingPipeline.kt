@@ -1129,7 +1129,7 @@ class VideoProcessingPipeline(
         prompt: String,
         modelId: String
     ): QaResult {
-        $result = geminiClient.generateStructured(
+        val result = geminiClient.generateStructured(
             projectId = projectId,
             stage = stage,
             modelId = modelId,
