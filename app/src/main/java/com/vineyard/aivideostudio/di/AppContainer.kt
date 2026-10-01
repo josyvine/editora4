@@ -20,6 +20,7 @@ import com.vineyard.aivideostudio.domain.pipeline.VideoProcessingPipeline
 import com.vineyard.aivideostudio.media.audio.AudioExtractor
 import com.vineyard.aivideostudio.media.audio.PcmToM4aConverter
 import com.vineyard.aivideostudio.media.transformer.Media3TransformerEngine
+import com.vineyard.aivideostudio.media.video.ObjectAnchorCalibrator
 import com.vineyard.aivideostudio.media.video.VideoMetadataReader
 import com.vineyard.aivideostudio.processing.controller.ProcessingController
 import com.vineyard.aivideostudio.processing.logger.LogSeverity
@@ -78,6 +79,9 @@ class AppContainer(private val context: Context) {
     val audioExtractor = AudioExtractor(context)
     val ttsEngine = GeminiTtsEngine(context, geminiApiService, geminiPreferences, modelRepository)
 
+    // On-Device Script-Mode Object & Face Calibrator
+    val objectAnchorCalibrator = ObjectAnchorCalibrator(context)
+
     // Hardware AAC Encoder for Live PCM Audio Streams
     val pcmToM4aConverter = PcmToM4aConverter(
         dispatcherProvider = dispatcherProvider,
@@ -105,6 +109,7 @@ class AppContainer(private val context: Context) {
         ttsEngine = ttsEngine,
         storageManager = projectStorageManager,
         preferences = processingPreferences,
+        objectAnchorCalibrator = objectAnchorCalibrator,
         logger = logger
     )
 
