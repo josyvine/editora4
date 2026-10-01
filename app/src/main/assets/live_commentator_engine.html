@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Editora Headless Live Commentator Engine</title>
+  <title>Editora Headless Live Commentator & Vision Engine</title>
   <script>
     // --- Global State Variables ---
     let liveWebSocket = null;
@@ -13,6 +13,7 @@
     let pendingPersonaPrompt = "";
     let accumulatedBotTranscript = "";
     let hasReceivedAudioChunks = false;
+    let pendingVisionTargetId = null;
 
     /**
      * Dispatches diagnostics to Android system log console via the Java Bridge.
@@ -51,11 +52,7 @@
     }
 
     /**
-     * Entry Point: Called by Android Kotlin via evaluateJavascript to start commentary generation.
-     * Reuses open WebSocket session if available for immediate sub-second voice synthesis.
-     *
-     * @param scriptText The commentary script containing emotional cue tags (e.g. [INSTRUCTIVE], [EXPLAINING]).
-     * @param personaPrompt The genre-conditioned director persona instructions.
+     * Entry Point 1: Starts commentary voice generation over the persistent Live WebSocket.
      */
     window.startCommentarySession = function(scriptText, personaPrompt) {
       logDiagnostic("startCommentarySession invoked by native engine.", "LIFECYCLE");
@@ -70,26 +67,78 @@
       accumulatedBotTranscript = "";
       hasReceivedAudioChunks = false;
 
-      // PERSISTENT CONNECTION: Reuse open WebSocket for zero-delay cue execution
       if (liveWebSocket && liveWebSocket.readyState === WebSocket.OPEN && isSessionConnected) {
-        logDiagnostic("Reusing persistent WebSocket session for cue (Zero Handshake Delay).", "NETWORK");
+        logDiagnostic("Reusing persistent WebSocket session for cue.", "NETWORK");
         dispatchCommentaryTurn();
       } else {
-        initiateLiveWebSocket();
+        initiateLiveWebSocket(() => dispatchCommentaryTurn());
       }
     };
 
     /**
-     * Connects to the Gemini Live BidiGenerateContent WebSocket endpoint.
+     * Entry Point 2: Streams a video frame to Gemini Live to ground target coordinates (Objects/Faces).
+     * Operates 100% through the Live Bidi WebSocket without REST HTTP calls.
      */
-    function initiateLiveWebSocket() {
+    window.groundTargetWithVision = function(base64Jpg, targetId, targetDescription) {
+      logDiagnostic(`groundTargetWithVision invoked for target: '${targetId}' (${targetDescription})`, "VISION");
+
+      if (!window.AndroidInterface) {
+        logDiagnostic("Fatal: Native AndroidInterface bridge is not bound.", "ERROR");
+        return;
+      }
+
+      pendingVisionTargetId = targetId;
+
+      const executeVisionTurn = () => {
+        if (!liveWebSocket || liveWebSocket.readyState !== WebSocket.OPEN) {
+          logDiagnostic("Cannot dispatch vision frame: WebSocket not open.", "WARN");
+          return;
+        }
+
+        const visionPayload = {
+          clientContent: {
+            turns: [{
+              role: "user",
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: "image/jpeg",
+                    data: base64Jpg
+                  }
+                },
+                {
+                  text: `Visually inspect this image. Locate the '${targetDescription}'. ` +
+                        `You MUST call the tool function 'locate_target' with target_id '${targetId}' ` +
+                        `and its exact normalized bounding box [left, top, right, bottom] coordinates (0.0 to 1.0).`
+                }
+              ]
+            }],
+            turnComplete: true
+          }
+        };
+
+        liveWebSocket.send(JSON.stringify(visionPayload));
+        logDiagnostic(`Vision frame dispatched for target '${targetId}'. Awaiting tool call...`, "VISION");
+      };
+
+      if (liveWebSocket && liveWebSocket.readyState === WebSocket.OPEN && isSessionConnected) {
+        executeVisionTurn();
+      } else {
+        initiateLiveWebSocket(() => executeVisionTurn());
+      }
+    };
+
+    /**
+     * Connects to the Gemini Live BidiGenerateContent WebSocket endpoint with Tools enabled.
+     */
+    function initiateLiveWebSocket(onConnectedCallback = null) {
       if (isConnectingSocket) {
         logDiagnostic("WebSocket connection already in progress. Awaiting handshake...", "NETWORK");
         return;
       }
 
       if (liveWebSocket && liveWebSocket.readyState === WebSocket.OPEN && isSessionConnected) {
-        dispatchCommentaryTurn();
+        if (typeof onConnectedCallback === "function") onConnectedCallback();
         return;
       }
 
@@ -114,7 +163,6 @@
           return;
         }
 
-        // Clean and validate model prefix
         if (modelId.startsWith("models/")) {
           modelId = modelId.replace("models/", "");
         }
@@ -123,22 +171,18 @@
         }
 
         const endpointUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
-        logDiagnostic(`Opening persistent WebSocket channel to model: models/${modelId} with voice: ${voiceName}`, "NETWORK");
+        logDiagnostic(`Opening persistent WebSocket channel to: models/${modelId}`, "NETWORK");
 
         liveWebSocket = new WebSocket(endpointUrl);
 
         liveWebSocket.onopen = () => {
-          logDiagnostic("WebSocket channel opened. Dispatching Setup Handshake frame...", "NETWORK");
+          logDiagnostic("WebSocket channel opened. Dispatching Setup frame with Vision Tools...", "NETWORK");
 
           let effectiveSystemInstruction = pendingPersonaPrompt;
           if (!effectiveSystemInstruction || effectiveSystemInstruction.trim() === "") {
-            effectiveSystemInstruction = "You are a professional studio voiceover narrator. " +
-              "Your sole task is to vocalize the provided text verbatim with clear, natural pronunciation and cadence. " +
-              "Do not add conversational filler, greetings, pleasantries, or preamble. " +
-              "Do not read bracketed stage directions like [EXPLAINING] or [INSTRUCTIVE] aloud as words.";
-          } else {
-            effectiveSystemInstruction += " " +
-              "CRITICAL DIRECTIVE: Recite the text verbatim. Do not add any conversational remarks, introductions, or greetings. Never say 'Okay', 'Sure', or 'Here is the voiceover'.";
+            effectiveSystemInstruction = "You are a professional studio video director and voiceover narrator. " +
+              "When provided with video frames to locate objects or faces, use the 'locate_target' function to report accurate normalized bounding boxes. " +
+              "When provided with a voiceover script, recite the text verbatim with clean studio delivery without conversational filler.";
           }
 
           const setupPayload = {
@@ -158,7 +202,43 @@
                 parts: [{
                   text: effectiveSystemInstruction
                 }]
-              }
+              },
+              tools: [
+                {
+                  functionDeclarations: [
+                    {
+                      name: "locate_target",
+                      description: "Reports the exact normalized bounding box coordinates for a target object, person, face, or item in the video frame.",
+                      parameters: {
+                        type: "OBJECT",
+                        properties: {
+                          target_id: {
+                            type: "STRING",
+                            description: "The identifier of the target being located."
+                          },
+                          left: {
+                            type: "NUMBER",
+                            description: "Normalized left boundary (0.0 to 1.0)."
+                          },
+                          top: {
+                            type: "NUMBER",
+                            description: "Normalized top boundary (0.0 to 1.0)."
+                          },
+                          right: {
+                            type: "NUMBER",
+                            description: "Normalized right boundary (0.0 to 1.0)."
+                          },
+                          bottom: {
+                            type: "NUMBER",
+                            description: "Normalized bottom boundary (0.0 to 1.0)."
+                          }
+                        },
+                        required: ["left", "top", "right", "bottom"]
+                      }
+                    }
+                  ]
+                }
+              ]
             }
           };
 
@@ -180,14 +260,15 @@
             if (payload.setupComplete) {
               isConnectingSocket = false;
               isSessionConnected = true;
-              logDiagnostic("Handshake complete: Live Model authenticated and ready to recite script.", "NETWORK");
+              logDiagnostic("Handshake complete: Live Model authenticated with Vision Tools.", "NETWORK");
 
               if (typeof window.AndroidInterface.onLiveSessionConnected === "function") {
                 window.AndroidInterface.onLiveSessionConnected();
               }
 
-              // Dispatch pending cue turn
-              dispatchCommentaryTurn();
+              if (typeof onConnectedCallback === "function") {
+                onConnectedCallback();
+              }
               return;
             }
 
@@ -199,11 +280,33 @@
               if (typeof window.AndroidInterface.onLiveError === "function") {
                 window.AndroidInterface.onLiveError(errorMsg);
               }
-              window.stopCommentarySession();
               return;
             }
 
-            // 3. Incoming Audio Stream & Transcripts
+            // 3. Incoming Tool Calls (Function Calling for Visual Coordinates)
+            if (payload.toolCall && payload.toolCall.functionCalls) {
+              for (const call of payload.toolCall.functionCalls) {
+                if (call.name === "locate_target") {
+                  const args = call.args || {};
+                  const targetId = args.target_id || pendingVisionTargetId || "target";
+                  const left = parseFloat(args.left) || 0.0;
+                  const top = parseFloat(args.top) || 0.0;
+                  const right = parseFloat(args.right) || 1.0;
+                  const bottom = parseFloat(args.bottom) || 1.0;
+
+                  logDiagnostic(`🎯 [LIVE-VISION] ToolCall: ${targetId} -> L:${left.toFixed(3)}, T:${top.toFixed(3)}, R:${right.toFixed(3)}, B:${bottom.toFixed(3)}`, "VISION");
+
+                  if (window.AndroidInterface && typeof window.AndroidInterface.onTargetCoordinatesReceived === "function") {
+                    window.AndroidInterface.onTargetCoordinatesReceived(targetId, left, top, right, bottom);
+                  }
+
+                  // Acknowledge tool call so WebSocket session stays synchronized
+                  sendToolResponse("locate_target", { status: "coordinates_registered" }, call.id);
+                }
+              }
+            }
+
+            // 4. Incoming Audio Stream & Transcripts
             if (payload.serverContent) {
               const serverContent = payload.serverContent;
 
@@ -229,19 +332,13 @@
                 }
               }
 
-              // 4. Model Turn Complete
+              // 5. Model Turn Complete
               if (serverContent.turnComplete) {
-                logDiagnostic("Gemini Live cue turn completed. Audio stream finished.", "LIFECYCLE");
-
-                if (!hasReceivedAudioChunks) {
-                  logDiagnostic("Warning: Turn completed without receiving audio chunks.", "WARN");
-                }
+                logDiagnostic("Gemini Live turn completed.", "LIFECYCLE");
 
                 if (typeof window.AndroidInterface.onLiveCommentaryFinished === "function") {
                   window.AndroidInterface.onLiveCommentaryFinished();
                 }
-
-                // KEEP CONNECTION ALIVE: Do not close WebSocket so the next cue starts with zero delay
               }
             }
           } catch (parseError) {
@@ -278,12 +375,28 @@
     }
 
     /**
+     * Responds to Gemini Live Tool Calls so the bidirectional stream continues.
+     */
+    function sendToolResponse(name, responseObj, callId) {
+      if (!liveWebSocket || liveWebSocket.readyState !== WebSocket.OPEN) return;
+      const toolResponsePayload = {
+        toolResponse: {
+          functionResponses: [{
+            response: { output: responseObj },
+            id: callId
+          }]
+        }
+      };
+      liveWebSocket.send(JSON.stringify(toolResponsePayload));
+    }
+
+    /**
      * Sends the commentary script turn to the connected Gemini Live model.
      */
     function dispatchCommentaryTurn() {
       if (!liveWebSocket || liveWebSocket.readyState !== WebSocket.OPEN) {
         logDiagnostic("Cannot dispatch commentary turn: WebSocket not open. Re-initiating...", "WARN");
-        initiateLiveWebSocket();
+        initiateLiveWebSocket(() => dispatchCommentaryTurn());
         return;
       }
 
@@ -340,6 +453,6 @@
 </head>
 <body style="background-color: #0B0E14; color: #FFFFFF; font-family: monospace; padding: 16px;">
   <h3>Editora Headless Live Commentator Runtime</h3>
-  <div id="status">Status: Persistent Engine Initialized</div>
+  <div id="status">Status: Persistent Engine Initialized with Live Vision Tools</div>
 </body>
 </html>
