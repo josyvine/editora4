@@ -816,7 +816,7 @@ class VideoProcessingPipeline(
             remappedTrackingIndicators
         }
 
-        // Auto-Fix 2: Script-Mode Object & Face Calibration (NEW)
+        // Pass logger instance into objectAnchorCalibrator methods
         val videoFileForCalibration = runCatching {
             val uri = Uri.parse(currentVideoUri)
             if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
