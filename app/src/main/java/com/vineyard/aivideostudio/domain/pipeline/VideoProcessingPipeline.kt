@@ -46,6 +46,7 @@ import com.vineyard.aivideostudio.media.audio.AudioExtractor
 import com.vineyard.aivideostudio.media.audio.PcmToM4aConverter
 import com.vineyard.aivideostudio.media.timeline.TimelineMapper
 import com.vineyard.aivideostudio.media.transformer.Media3TransformerEngine
+import com.vineyard.aivideostudio.media.video.ObjectAnchorCalibrator
 import com.vineyard.aivideostudio.media.video.OcrAnchorCalibrator
 import com.vineyard.aivideostudio.media.video.VideoMetadataReader
 import com.vineyard.aivideostudio.processing.logger.LogSeverity
@@ -78,6 +79,7 @@ class VideoProcessingPipeline(
     private val ttsEngine: GeminiTtsEngine,
     private val storageManager: ProjectStorageManager,
     private val preferences: ProcessingPreferences,
+    private val objectAnchorCalibrator: ObjectAnchorCalibrator,
     private val logger: ProcessingLogger
 ) {
 
@@ -793,7 +795,7 @@ class VideoProcessingPipeline(
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
-        // Auto-Fix: Calibrate misplaced tracking indicators against actual on-screen text before export with live telemetry
+        // Auto-Fix 1: OCR Text Calibration (Existing - 100% untouched)
         val calibratedTrackingIndicators = try {
             OcrAnchorCalibrator.calibrateIndicators(
                 context = context,
@@ -814,10 +816,46 @@ class VideoProcessingPipeline(
             remappedTrackingIndicators
         }
 
+        // Auto-Fix 2: Script-Mode Object & Face Calibration (NEW)
+        val videoFileForCalibration = runCatching {
+            val uri = Uri.parse(currentVideoUri)
+            if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
+        }.getOrNull() ?: File(currentVideoUri)
+
+        val fullyCalibratedBlurSpecs = try {
+            objectAnchorCalibrator.calibrateBlurSpecs(
+                videoFile = videoFileForCalibration,
+                blurSpecs = remappedBlurSpecs
+            )
+        } catch (e: Exception) {
+            logger.log(
+                projectId,
+                PipelineStatus.EXPORTING,
+                "Object/Face Blur auto-fix skipped: ${e.message}",
+                LogSeverity.WARNING
+            )
+            remappedBlurSpecs
+        }
+
+        val fullyCalibratedTrackingIndicators = try {
+            objectAnchorCalibrator.calibrateTrackingIndicators(
+                videoFile = videoFileForCalibration,
+                indicators = calibratedTrackingIndicators
+            )
+        } catch (e: Exception) {
+            logger.log(
+                projectId,
+                PipelineStatus.EXPORTING,
+                "Object/Face Tracking auto-fix skipped: ${e.message}",
+                LogSeverity.WARNING
+            )
+            calibratedTrackingIndicators
+        }
+
         logger.log(
             projectId,
             PipelineStatus.EXPORTING,
-            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${calibratedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | PurgeSourceAudio=true",
+            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${fullyCalibratedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${fullyCalibratedBlurSpecs.size} | PurgeSourceAudio=true",
             LogSeverity.INFO
         )
 
@@ -831,10 +869,10 @@ class VideoProcessingPipeline(
             targetAspectRatio = if (recipe.audioOnlyMode) "ORIGINAL" else (recipe.projectInfo?.targetAspectRatio ?: project.targetAspectRatio),
             zoomScale = if (recipe.audioOnlyMode) 1.0f else (recipe.editingPlan.zoom?.scale ?: 1.0f),
             speedRamps = speedSpecs,
-            blurSpecs = remappedBlurSpecs,
+            blurSpecs = fullyCalibratedBlurSpecs,
             replacementOverlays = remappedReplacementOverlays,
             colorGrade = colorGradeSpec,
-            trackingIndicators = calibratedTrackingIndicators,
+            trackingIndicators = fullyCalibratedTrackingIndicators,
             textCards = remappedTextCards,
             videoWidth = project.metadata.width,
             videoHeight = project.metadata.height
@@ -1091,7 +1129,7 @@ class VideoProcessingPipeline(
         prompt: String,
         modelId: String
     ): QaResult {
-        val result = geminiClient.generateStructured(
+        $result = geminiClient.generateStructured(
             projectId = projectId,
             stage = stage,
             modelId = modelId,
