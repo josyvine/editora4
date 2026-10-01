@@ -16,14 +16,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
+import kotlin.math.hypot
 
 object OcrAnchorCalibrator {
 
     private const val TAG = "OcrAnchorCalibrator"
+    private const val MAX_SEARCH_RADIUS_NORMALIZED = 0.30f // Search within 30% of estimated area
 
     /**
-     * Inspects video frames at indicator trigger times, finds real on-screen text,
-     * and snaps misplaced script coordinates directly to the target UI elements.
+     * Universally calibrates tracking indicators for any video:
+     * 1. Inspects video frames at trigger times.
+     * 2. Finds matching text blocks near the estimated coordinates.
+     * 3. Snaps bounding boxes directly to the real UI targets with zero human script editing.
      */
     suspend fun calibrateIndicators(
         context: Context,
@@ -51,10 +55,9 @@ object OcrAnchorCalibrator {
                 val searchTarget = indicator.targetText?.trim()
                 val hasSearchTarget = !searchTarget.isNullOrBlank()
 
-                // If no specific target text is declared, check if label can serve as search anchor
                 val anchorQuery = if (hasSearchTarget) {
                     searchTarget
-                } else if (!indicator.label.isNullOrBlank() && indicator.label.length > 3) {
+                } else if (!indicator.label.isNullOrBlank() && indicator.label.length > 2) {
                     indicator.label.trim()
                 } else {
                     null
@@ -65,7 +68,7 @@ object OcrAnchorCalibrator {
                     continue
                 }
 
-                // 1. Extract ONE single frame snapshot at the indicator's trigger millisecond
+                // 1. Extract snapshot frame at the indicator's trigger millisecond
                 val timeUs = (indicator.startTimeMs * 1000L).coerceAtLeast(0L)
                 val frameBitmap = try {
                     retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
@@ -79,38 +82,46 @@ object OcrAnchorCalibrator {
                     continue
                 }
 
-                // 2. Scan frame using on-device ML Kit OCR
+                val frameW = frameBitmap.width.toFloat().coerceAtLeast(1f)
+                val frameH = frameBitmap.height.toFloat().coerceAtLeast(1f)
+
+                // 2. Resolve estimated center point from script
+                val hintCenterX = indicator.staticBounds?.centerX ?: 0.5f
+                val hintCenterY = indicator.staticBounds?.centerY ?: 0.5f
+
+                // 3. Scan frame using on-device ML Kit OCR
                 val recognizedText = processOcr(textRecognizer, frameBitmap)
-                val matchedRect = findMatchingTextBounds(recognizedText, anchorQuery)
+                val matchedRect = findBestMatchingBlock(
+                    ocrText = recognizedText,
+                    query = anchorQuery,
+                    hintCenterX = hintCenterX,
+                    hintCenterY = hintCenterY,
+                    frameWidth = frameW,
+                    frameHeight = frameH
+                )
 
                 if (matchedRect != null) {
-                    val frameW = frameBitmap.width.toFloat().coerceAtLeast(1f)
-                    val frameH = frameBitmap.height.toFloat().coerceAtLeast(1f)
+                    // 4. Calculate universal padded bounds
+                    val padX = (matchedRect.width() * 0.12f).coerceAtLeast(20f)
+                    val padY = (matchedRect.height() * 0.15f).coerceAtLeast(14f)
 
-                    // 3. Snap & calculate padded normalized coordinates
-                    // Pad horizontally by 12% to ensure adjacent toggles/switches are enclosed
-                    val padX = (matchedRect.width() * 0.15f).coerceAtLeast(24f)
-                    val padY = (matchedRect.height() * 0.20f).coerceAtLeast(16f)
+                    // Expand right edge if target is an interactive toggle row
+                    val isToggleRow = anchorQuery.contains("Grounding", ignoreCase = true) ||
+                            anchorQuery.contains("context", ignoreCase = true) ||
+                            anchorQuery.contains("Search", ignoreCase = true) ||
+                            anchorQuery.contains("model", ignoreCase = true)
 
-                    // If it's a toggle row, expand right edge towards screen edge to include the toggle switch
-                    val expandForToggle = if (indicator.label?.contains("GROUNDING", ignoreCase = true) == true ||
-                        anchorQuery.contains("Grounding", ignoreCase = true) ||
-                        anchorQuery.contains("context", ignoreCase = true)
-                    ) {
-                        frameW * 0.25f
-                    } else {
-                        padX
-                    }
+                    val expandRight = if (isToggleRow) (frameW * 0.22f) else padX
 
                     val snappedLeft = ((matchedRect.left - padX) / frameW).coerceIn(0.0f, 1.0f)
                     val snappedTop = ((matchedRect.top - padY) / frameH).coerceIn(0.0f, 1.0f)
-                    val snappedRight = ((matchedRect.right + expandForToggle) / frameW).coerceIn(snappedLeft + 0.05f, 1.0f)
+                    val snappedRight = ((matchedRect.right + expandRight) / frameW).coerceIn(snappedLeft + 0.05f, 1.0f)
                     val snappedBottom = ((matchedRect.bottom + padY) / frameH).coerceIn(snappedTop + 0.02f, 1.0f)
 
                     Log.i(
                         TAG,
-                        "Auto-Fix Snapped '${indicator.id}' [Anchor: '$anchorQuery'] " +
-                                "from Y=${indicator.staticBounds?.top ?: 0f} to Real Text Y=$snappedTop"
+                        "Universal Auto-Snap: '${indicator.id}' ['$anchorQuery'] " +
+                                "snapped to Real UI [L=${"%.2f".format(snappedLeft)}, T=${"%.2f".format(snappedTop)}, R=${"%.2f".format(snappedRight)}, B=${"%.2f".format(snappedBottom)}]"
                     )
 
                     val updatedBounds = NormalizedBounds(
@@ -127,7 +138,7 @@ object OcrAnchorCalibrator {
                         )
                     )
                 } else {
-                    // Safe fallback: Retain original script bounds if text was occluded
+                    // Safe fallback: Retain original script bounds if text was not detected
                     calibratedIndicators.add(indicator)
                 }
             }
@@ -153,29 +164,66 @@ object OcrAnchorCalibrator {
             }
     }
 
-    private fun findMatchingTextBounds(ocrText: Text?, query: String): Rect? {
+    /**
+     * Finds the closest matching text block to the estimated target coordinates,
+     * handling multi-line text wrapping and rejecting far-away false positives.
+     */
+    private fun findBestMatchingBlock(
+        ocrText: Text?,
+        query: String,
+        hintCenterX: Float,
+        hintCenterY: Float,
+        frameWidth: Float,
+        frameHeight: Float
+    ): Rect? {
         if (ocrText == null || query.isBlank()) return null
         val cleanQuery = query.lowercase().replace("_", " ").trim()
         val queryKeywords = cleanQuery.split(" ").filter { it.length > 2 }
 
         var bestRect: Rect? = null
-        var maxKeywordMatches = 0
+        var bestScore = -1f
 
-        // Search text lines for exact phrase or high keyword overlap
         for (block in ocrText.textBlocks) {
+            val blockBox = block.boundingBox ?: continue
+            val blockNormCenterX = (blockBox.exactCenterX()) / frameWidth
+            val blockNormCenterY = (blockBox.exactCenterY()) / frameHeight
+
+            // Proximity Filter: Only consider elements within the target neighborhood
+            val distance = hypot(blockNormCenterX - hintCenterX, blockNormCenterY - hintCenterY)
+            if (distance > MAX_SEARCH_RADIUS_NORMALIZED && hintCenterX != 0.5f) {
+                continue
+            }
+
+            val unifiedBlockText = block.text.replace("\n", " ").lowercase()
+
+            // 1. Exact phrase match inside block
+            if (unifiedBlockText.contains(cleanQuery)) {
+                return blockBox
+            }
+
+            // 2. Keyword overlap match
+            val keywordMatches = queryKeywords.count { unifiedBlockText.contains(it) }
+            if (keywordMatches > 0) {
+                // Score = keyword match ratio weighted by closeness to estimated position
+                val matchRatio = keywordMatches.toFloat() / queryKeywords.size.coerceAtLeast(1)
+                val proximityWeight = (1.0f - (distance / MAX_SEARCH_RADIUS_NORMALIZED)).coerceIn(0.1f, 1.0f)
+                val score = (matchRatio * 0.7f) + (proximityWeight * 0.3f)
+
+                if (score > bestScore && matchRatio >= 0.5f) {
+                    bestScore = score
+                    bestRect = blockBox
+                }
+            }
+
+            // 3. Line-level check inside block for single-line targets
             for (line in block.lines) {
                 val lineText = line.text.lowercase()
+                val lineBox = line.boundingBox ?: continue
+                val lineNormCenterY = lineBox.exactCenterY() / frameHeight
+                val lineDist = kotlin.math.abs(lineNormCenterY - hintCenterY)
 
-                // Exact phrase match
-                if (lineText.contains(cleanQuery)) {
-                    return line.boundingBox
-                }
-
-                // Keyword overlap match (handles slight OCR misspelling or multi-line breaks)
-                val matches = queryKeywords.count { lineText.contains(it) }
-                if (matches > maxKeywordMatches && matches >= (queryKeywords.size / 2).coerceAtLeast(1)) {
-                    maxKeywordMatches = matches
-                    bestRect = line.boundingBox
+                if (lineText.contains(cleanQuery) && lineDist <= MAX_SEARCH_RADIUS_NORMALIZED) {
+                    return lineBox
                 }
             }
         }
