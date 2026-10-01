@@ -495,7 +495,7 @@ class VideoProcessingPipeline(
             recordStep(projectId, PipelineStatus.TTS_GENERATION, StepStatus.COMPLETED, "Live commentary track ready")
         }
 
-        // 9. AUDIO MIX & FINAL EXPORT
+        // 9. AUDIO MIX & FINAL EXPORT (With Universal Aspect Ratio Resolution Binding)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production video with burned-in subtitles")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
@@ -507,7 +507,9 @@ class VideoProcessingPipeline(
             stripOriginalAudio = true,
             captions = captionsToSave,
             targetAspectRatio = project.targetAspectRatio,
-            zoomScale = if (zoomDecision.isNecessary) zoomDecision.toScale else 1.0f
+            zoomScale = if (zoomDecision.isNecessary) zoomDecision.toScale else 1.0f,
+            videoWidth = project.metadata.width,
+            videoHeight = project.metadata.height
         )
 
         val finalVideoUri = when (exportResult) {
@@ -786,7 +788,7 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT
+        // 7. FINAL PRODUCTION EXPORT (With Universal Resolution Binding)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
         logger.log(
@@ -810,7 +812,9 @@ class VideoProcessingPipeline(
             replacementOverlays = remappedReplacementOverlays,
             colorGrade = colorGradeSpec,
             trackingIndicators = remappedTrackingIndicators,
-            textCards = remappedTextCards
+            textCards = remappedTextCards,
+            videoWidth = project.metadata.width,
+            videoHeight = project.metadata.height
         )
 
         val finalVideoUri = when (exportResult) {
