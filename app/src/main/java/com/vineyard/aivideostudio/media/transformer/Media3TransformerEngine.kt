@@ -200,10 +200,19 @@ class Media3TransformerEngine(private val context: Context) {
         replacementOverlays: List<ReplacementOverlaySpec> = emptyList(),
         colorGrade: ColorGradeSpec? = null,
         trackingIndicators: List<TrackingIndicatorSpec> = emptyList(),
-        textCards: List<TextCardSpec> = emptyList()
+        textCards: List<TextCardSpec> = emptyList(),
+        videoWidth: Int? = null,
+        videoHeight: Int? = null
     ): AppResult<File> = withContext(Dispatchers.Main) {
         outputFile.parentFile?.mkdirs()
         if (outputFile.exists()) outputFile.delete()
+
+        // Resolve exact video resolution dynamically (prevents aspect ratio stretching)
+        val (resolvedWidth, resolvedHeight) = if (videoWidth != null && videoHeight != null && videoWidth > 0 && videoHeight > 0) {
+            Pair(videoWidth, videoHeight)
+        } else {
+            getVideoDimensions(inputUri)
+        }
 
         val sharedVideoEffects = mutableListOf<Effect>()
 
@@ -238,11 +247,18 @@ class Media3TransformerEngine(private val context: Context) {
         val overlayList = mutableListOf<TextureOverlay>()
 
         if (captions.isNotEmpty()) {
-            overlayList.add(SubtitleBitmapOverlay(captions))
+            overlayList.add(SubtitleBitmapOverlay(captions, resolvedWidth, resolvedHeight))
         }
 
         if (replacementOverlays.isNotEmpty() || trackingIndicators.isNotEmpty()) {
-            overlayList.add(DynamicGraphicsOverlay(replacementOverlays, trackingIndicators))
+            overlayList.add(
+                DynamicGraphicsOverlay(
+                    replacements = replacementOverlays,
+                    trackingIndicators = trackingIndicators,
+                    targetWidth = resolvedWidth,
+                    targetHeight = resolvedHeight
+                )
+            )
         }
 
         if (textCards.isNotEmpty()) {
@@ -371,6 +387,27 @@ class Media3TransformerEngine(private val context: Context) {
             .setRemoveAudio(stripAudio)
             .setEffects(Effects(emptyList(), segmentEffects))
             .build()
+    }
+
+    private fun getVideoDimensions(uri: Uri): Pair<Int, Int> {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1080
+            val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1920
+
+            // If video is rotated 90 or 270 degrees, swap width and height
+            if (rotation == 90 || rotation == 270) {
+                Pair(rawHeight, rawWidth)
+            } else {
+                Pair(rawWidth, rawHeight)
+            }
+        } catch (_: Exception) {
+            Pair(1080, 1920)
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
     }
 
     private fun getVideoDurationMs(uri: Uri): Long {
