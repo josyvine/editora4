@@ -10,8 +10,11 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.vineyard.aivideostudio.core.model.PipelineStatus
 import com.vineyard.aivideostudio.core.model.effects.NormalizedBounds
 import com.vineyard.aivideostudio.core.model.effects.TrackingIndicatorSpec
+import com.vineyard.aivideostudio.processing.logger.LogSeverity
+import com.vineyard.aivideostudio.processing.logger.ProcessingLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -28,13 +31,16 @@ object OcrAnchorCalibrator {
      * 1. Inspects video frames at trigger times.
      * 2. Finds matching text blocks near the estimated coordinates.
      * 3. Snaps bounding boxes directly to the real UI targets with zero human script editing.
+     * 4. Dispatches full real-time diagnostic telemetry to the in-app log console.
      */
     suspend fun calibrateIndicators(
         context: Context,
         videoUri: Uri,
         indicators: List<TrackingIndicatorSpec>,
         videoWidth: Int,
-        videoHeight: Int
+        videoHeight: Int,
+        logger: ProcessingLogger? = null,
+        projectId: String? = null
     ): List<TrackingIndicatorSpec> = withContext(Dispatchers.IO) {
         if (indicators.isEmpty()) return@withContext indicators
 
@@ -45,6 +51,14 @@ object OcrAnchorCalibrator {
             retriever.setDataSource(context, videoUri)
         } catch (e: Exception) {
             Log.w(TAG, "Cannot set data source for video frame extraction: ${e.message}")
+            if (projectId != null && logger != null) {
+                logger.log(
+                    projectId,
+                    PipelineStatus.EXPORTING,
+                    "OCR frame extraction skipped: ${e.message}",
+                    LogSeverity.WARNING
+                )
+            }
             return@withContext indicators
         }
 
@@ -89,6 +103,15 @@ object OcrAnchorCalibrator {
                 val hintCenterX = indicator.staticBounds?.centerX ?: 0.5f
                 val hintCenterY = indicator.staticBounds?.centerY ?: 0.5f
 
+                if (projectId != null && logger != null) {
+                    logger.log(
+                        projectId,
+                        PipelineStatus.EXPORTING,
+                        "Scanning frame at ${indicator.startTimeMs}ms for on-screen anchor '$anchorQuery'...",
+                        LogSeverity.INFO
+                    )
+                }
+
                 // 3. Scan frame using on-device ML Kit OCR
                 val recognizedText = processOcr(textRecognizer, frameBitmap)
                 val matchedRect = findBestMatchingBlock(
@@ -118,11 +141,18 @@ object OcrAnchorCalibrator {
                     val snappedRight = ((matchedRect.right + expandRight) / frameW).coerceIn(snappedLeft + 0.05f, 1.0f)
                     val snappedBottom = ((matchedRect.bottom + padY) / frameH).coerceIn(snappedTop + 0.02f, 1.0f)
 
-                    Log.i(
-                        TAG,
-                        "Universal Auto-Snap: '${indicator.id}' ['$anchorQuery'] " +
-                                "snapped to Real UI [L=${"%.2f".format(snappedLeft)}, T=${"%.2f".format(snappedTop)}, R=${"%.2f".format(snappedRight)}, B=${"%.2f".format(snappedBottom)}]"
-                    )
+                    val logMsg = "[OCR_AUTOFIX] Snapped '${indicator.id}' ['$anchorQuery'] " +
+                            "from Script Y=${"%.2f".format(indicator.staticBounds?.top ?: 0f)} -> Real Text Y=${"%.2f".format(snappedTop)}"
+
+                    Log.i(TAG, logMsg)
+                    if (projectId != null && logger != null) {
+                        logger.log(
+                            projectId,
+                            PipelineStatus.EXPORTING,
+                            logMsg,
+                            LogSeverity.SUCCESS
+                        )
+                    }
 
                     val updatedBounds = NormalizedBounds(
                         left = snappedLeft,
@@ -139,6 +169,14 @@ object OcrAnchorCalibrator {
                     )
                 } else {
                     // Safe fallback: Retain original script bounds if text was not detected
+                    if (projectId != null && logger != null) {
+                        logger.log(
+                            projectId,
+                            PipelineStatus.EXPORTING,
+                            "Anchor text '$anchorQuery' not detected on frame, retaining script bounds [T=${"%.2f".format(indicator.staticBounds?.top ?: 0f)}]",
+                            LogSeverity.INFO
+                        )
+                    }
                     calibratedIndicators.add(indicator)
                 }
             }
@@ -204,7 +242,6 @@ object OcrAnchorCalibrator {
             // 2. Keyword overlap match
             val keywordMatches = queryKeywords.count { unifiedBlockText.contains(it) }
             if (keywordMatches > 0) {
-                // Score = keyword match ratio weighted by closeness to estimated position
                 val matchRatio = keywordMatches.toFloat() / queryKeywords.size.coerceAtLeast(1)
                 val proximityWeight = (1.0f - (distance / MAX_SEARCH_RADIUS_NORMALIZED)).coerceIn(0.1f, 1.0f)
                 val score = (matchRatio * 0.7f) + (proximityWeight * 0.3f)
