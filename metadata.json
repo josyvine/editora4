@@ -1,0 +1,7 @@
+{
+  "name": "Editora",
+  "description": "AI-assisted video editing studio powered by Gemini reasoning and Android Media3 with sequential QA verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
