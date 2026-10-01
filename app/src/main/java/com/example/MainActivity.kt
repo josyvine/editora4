@@ -1,0 +1,21 @@
+package com.example
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import com.vineyard.aivideostudio.ui.navigation.AppNavGraph
+import com.vineyard.aivideostudio.ui.theme.EditoraTheme
+
+class MainActivity : ComponentActivity() {
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    enableEdgeToEdge()
+    setContent {
+      EditoraTheme {
+        AppNavGraph()
+      }
+    }
+  }
+}
+
