@@ -1,6 +1,8 @@
 package com.vineyard.aivideostudio.domain.pipeline
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.vineyard.aivideostudio.ai.gemini.GeminiClient
 import com.vineyard.aivideostudio.ai.model.AiQaResponse
@@ -12,6 +14,7 @@ import com.vineyard.aivideostudio.ai.model.CropDecision
 import com.vineyard.aivideostudio.ai.model.HighlightSegment
 import com.vineyard.aivideostudio.ai.model.MasterRecipe
 import com.vineyard.aivideostudio.ai.model.ModelPurpose
+import com.vineyard.aivideostudio.ai.model.NormalizedBoundsDto
 import com.vineyard.aivideostudio.ai.model.SourceAnalysis
 import com.vineyard.aivideostudio.ai.model.TrimDecision
 import com.vineyard.aivideostudio.ai.model.TrimSegment
@@ -32,6 +35,7 @@ import com.vineyard.aivideostudio.core.model.TimelineMap
 import com.vineyard.aivideostudio.core.model.TranscriptSegment
 import com.vineyard.aivideostudio.core.model.effects.BlurSpec
 import com.vineyard.aivideostudio.core.model.effects.ColorGradeSpec
+import com.vineyard.aivideostudio.core.model.effects.NormalizedBounds
 import com.vineyard.aivideostudio.core.model.effects.ReplacementOverlaySpec
 import com.vineyard.aivideostudio.core.model.effects.SpeedRampSpec
 import com.vineyard.aivideostudio.core.model.effects.TextCardSpec
@@ -64,6 +68,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
 
@@ -791,11 +796,11 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (With Universal Resolution Binding & Real-Time OCR Telemetry)
+        // 7. FINAL PRODUCTION EXPORT (With Gemini Vision Anchor Grounding + Local ML Kit Snap)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
-        // Auto-Fix 1: OCR Text Calibration (Existing - 100% untouched)
+        // Auto-Fix 1: OCR Text Calibration (Existing UI Text Snapping - 100% untouched)
         val calibratedTrackingIndicators = try {
             OcrAnchorCalibrator.calibrateIndicators(
                 context = context,
@@ -816,16 +821,31 @@ class VideoProcessingPipeline(
             remappedTrackingIndicators
         }
 
-        // Pass logger instance into objectAnchorCalibrator methods
+        // Auto-Fix 2: Multimodal Gemini Vision Grounding -> Leads On-Device ML Kit
         val videoFileForCalibration = runCatching {
             val uri = Uri.parse(currentVideoUri)
             if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
         }.getOrNull() ?: File(currentVideoUri)
 
+        // Ground blur targets through Gemini Vision if coordinates need directional validation
+        val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
+            projectId = projectId,
+            videoFile = videoFileForCalibration,
+            blurSpecs = remappedBlurSpecs
+        )
+
+        // Ground tracking indicators through Gemini Vision if coordinates need directional validation
+        val visionGroundedTrackingIndicators = groundTrackingTargetsWithVision(
+            projectId = projectId,
+            videoFile = videoFileForCalibration,
+            indicators = calibratedTrackingIndicators
+        )
+
+        // Hand over Vision-grounded targets to local ML Kit for pixel-level snap
         val fullyCalibratedBlurSpecs = try {
             objectAnchorCalibrator.calibrateBlurSpecs(
                 videoFile = videoFileForCalibration,
-                blurSpecs = remappedBlurSpecs
+                blurSpecs = visionGroundedBlurSpecs
             )
         } catch (e: Exception) {
             logger.log(
@@ -834,13 +854,13 @@ class VideoProcessingPipeline(
                 "Object/Face Blur auto-fix skipped: ${e.message}",
                 LogSeverity.WARNING
             )
-            remappedBlurSpecs
+            visionGroundedBlurSpecs
         }
 
         val fullyCalibratedTrackingIndicators = try {
             objectAnchorCalibrator.calibrateTrackingIndicators(
                 videoFile = videoFileForCalibration,
-                indicators = calibratedTrackingIndicators
+                indicators = visionGroundedTrackingIndicators
             )
         } catch (e: Exception) {
             logger.log(
@@ -849,7 +869,7 @@ class VideoProcessingPipeline(
                 "Object/Face Tracking auto-fix skipped: ${e.message}",
                 LogSeverity.WARNING
             )
-            calibratedTrackingIndicators
+            visionGroundedTrackingIndicators
         }
 
         logger.log(
@@ -922,6 +942,134 @@ class VideoProcessingPipeline(
 
         val updatedProject = projectRepository.getProjectById(projectId) ?: project
         AppResult.Success(updatedProject)
+    }
+
+    /**
+     * Uses your selected Live/Vision model to verify and ground physical object & face coordinates
+     * before passing to local ML Kit. Corrects misplaced script coordinates.
+     */
+    private suspend fun groundTrackingTargetsWithVision(
+        projectId: String,
+        videoFile: File,
+        indicators: List<TrackingIndicatorSpec>
+    ): List<TrackingIndicatorSpec> {
+        val targetsToGround = indicators.filter { it.targetType.equals("object", ignoreCase = true) || it.targetType.equals("face", ignoreCase = true) }
+        if (targetsToGround.isEmpty() || !videoFile.exists()) return indicators
+
+        val selectedVisionModel = modelRepository.getSelectedModelForPurpose(ModelPurpose.LIVE_VOICE)
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(videoFile.absolutePath)
+            indicators.map { indicator ->
+                if (!indicator.targetType.equals("object", ignoreCase = true) && !indicator.targetType.equals("face", ignoreCase = true)) {
+                    return@map indicator
+                }
+
+                val frameBitmap = retriever.getFrameAtTime(indicator.startTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: return@map indicator
+
+                val frameFile = storageManager.createStageOutputFile(projectId, PipelineStatus.TRIM_ANALYSIS)
+                val fos = FileOutputStream(frameFile)
+                frameBitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                fos.flush()
+                fos.close()
+                frameBitmap.recycle()
+
+                val targetDesc = indicator.label ?: indicator.objectClass ?: indicator.targetType ?: "target object"
+                val prompt = "Look at this image. Locate the '$targetDesc'. Return ONLY a JSON object with the exact normalized coordinates: {\"left\": float, \"top\": float, \"right\": float, \"bottom\": float} between 0.0 and 1.0."
+
+                val visionResult = geminiClient.generateStructured(
+                    projectId = projectId,
+                    stage = PipelineStatus.EXPORTING,
+                    modelId = selectedVisionModel,
+                    prompt = prompt,
+                    mediaUri = frameFile.absolutePath,
+                    mediaMimeType = "image/jpeg"
+                ) { json -> JsonUtils.fromJson<NormalizedBoundsDto>(json) }
+
+                frameFile.delete()
+
+                if (visionResult is AppResult.Success) {
+                    val boundsDto = visionResult.data
+                    val visionBounds = boundsDto.toNormalizedBounds()
+                    logger.log(
+                        projectId,
+                        PipelineStatus.EXPORTING,
+                        "👁️ [VISION-GROUNDING] Target '${indicator.id}' ($targetDesc) grounded by $selectedVisionModel: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
+                        LogSeverity.INFO
+                    )
+                    indicator.copy(staticBounds = visionBounds)
+                } else {
+                    indicator
+                }
+            }
+        } catch (e: Exception) {
+            logger.log(projectId, PipelineStatus.EXPORTING, "Vision grounding skipped: ${e.message}", LogSeverity.INFO)
+            indicators
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+    }
+
+    private suspend fun groundBlurTargetsWithVision(
+        projectId: String,
+        videoFile: File,
+        blurSpecs: List<BlurSpec>
+    ): List<BlurSpec> {
+        val targetsToGround = blurSpecs.filter { it.targetType.equals("face", ignoreCase = true) || it.targetType.equals("object", ignoreCase = true) }
+        if (targetsToGround.isEmpty() || !videoFile.exists()) return blurSpecs
+
+        val selectedVisionModel = modelRepository.getSelectedModelForPurpose(ModelPurpose.LIVE_VOICE)
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(videoFile.absolutePath)
+            blurSpecs.map { spec ->
+                if (!spec.targetType.equals("face", ignoreCase = true) && !spec.targetType.equals("object", ignoreCase = true)) {
+                    return@map spec
+                }
+
+                val frameBitmap = retriever.getFrameAtTime(spec.startTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: return@map spec
+
+                val frameFile = storageManager.createStageOutputFile(projectId, PipelineStatus.TRIM_ANALYSIS)
+                val fos = FileOutputStream(frameFile)
+                frameBitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                fos.flush()
+                fos.close()
+                frameBitmap.recycle()
+
+                val prompt = "Look at this image. Locate the '${spec.targetType}'. Return ONLY a JSON object with the exact normalized coordinates: {\"left\": float, \"top\": float, \"right\": float, \"bottom\": float} between 0.0 and 1.0."
+
+                val visionResult = geminiClient.generateStructured(
+                    projectId = projectId,
+                    stage = PipelineStatus.EXPORTING,
+                    modelId = selectedVisionModel,
+                    prompt = prompt,
+                    mediaUri = frameFile.absolutePath,
+                    mediaMimeType = "image/jpeg"
+                ) { json -> JsonUtils.fromJson<NormalizedBoundsDto>(json) }
+
+                frameFile.delete()
+
+                if (visionResult is AppResult.Success) {
+                    val visionBounds = visionResult.data.toNormalizedBounds()
+                    logger.log(
+                        projectId,
+                        PipelineStatus.EXPORTING,
+                        "👁️ [VISION-GROUNDING] Blur target '${spec.targetType}' grounded by $selectedVisionModel: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
+                        LogSeverity.INFO
+                    )
+                    spec.copy(bounds = visionBounds)
+                } else {
+                    spec
+                }
+            }
+        } catch (e: Exception) {
+            logger.log(projectId, PipelineStatus.EXPORTING, "Vision blur grounding skipped: ${e.message}", LogSeverity.INFO)
+            blurSpecs
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
     }
 
     /**
