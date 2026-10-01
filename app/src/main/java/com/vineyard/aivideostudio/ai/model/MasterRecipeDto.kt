@@ -284,6 +284,8 @@ data class RecipeTrackingDto(
     @Json(name = "color_hex") val colorHex: String = "#FF0000",
     @Json(name = "stroke_width_px") val strokeWidthPx: Float = 6.0f,
     @Json(name = "label") val label: String? = null,
+    @Json(name = "targetText") val targetText: String? = null,          // OCR search query (e.g. "Grounding with Google Search")
+    @Json(name = "target_text") val targetTextSnake: String? = null,    // snake_case support
     @Json(name = "trackingMode") val trackingMode: String? = null,      // "static", "keyframes", or "auto"
     @Json(name = "tracking_mode") val trackingModeSnake: String? = null, // snake_case support
     @Json(name = "start_time_ms") val startTimeMs: Long = 0L,
@@ -308,6 +310,7 @@ data class RecipeTrackingDto(
             else -> ArrowDirection.DOWN
         }
         val resolvedMode = trackingMode ?: trackingModeSnake ?: "auto"
+        val resolvedTargetText = targetText ?: targetTextSnake
 
         return TrackingIndicatorSpec(
             id = id ?: "track_ind_${index}_${System.currentTimeMillis()}",
@@ -316,12 +319,13 @@ data class RecipeTrackingDto(
             colorHex = colorHex,
             strokeWidthPx = strokeWidthPx,
             label = label,
-            startTimeMs = startTimeMs,
-            endTimeMs = endTimeMs,
-            staticBounds = staticBounds?.toNormalizedBounds(),
+            start_time_ms = startTimeMs,
+            end_time_ms = endTimeMs,
+            static_bounds = staticBounds?.toNormalizedBounds(),
             dimBackgroundOpacity = dimBackgroundOpacity.coerceIn(0.0f, 1.0f),
             keyframes = keyframes.map { it.toTrackingKeyframe() },
-            trackingMode = resolvedMode
+            trackingMode = resolvedMode,
+            targetText = resolvedTargetText
         )
     }
 }
