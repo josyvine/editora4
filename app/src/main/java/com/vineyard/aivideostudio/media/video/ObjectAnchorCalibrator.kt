@@ -30,7 +30,8 @@ import java.io.File
  * ML Kit detection, and magnetically snaps coordinates to physical pixel edges.
  */
 class ObjectAnchorCalibrator(
-    private val context: Context
+    private val context: Context,
+    private val logger: ProcessingLogger
 ) {
 
     companion object {
@@ -71,13 +72,13 @@ class ObjectAnchorCalibrator(
             return@withContext blurSpecs
         }
 
-        ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Starting Script-Mode Auto-Fix calibration for ${activeSpecs.size} blur target(s)...", LogSeverity.INFO)
+        logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Starting Script-Mode Auto-Fix calibration for ${activeSpecs.size} blur target(s)...", LogSeverity.INFO)
 
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(videoFile.absolutePath)
         } catch (e: Exception) {
-            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Failed to load video dataSource for calibration: ${e.message}", LogSeverity.ERROR)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Failed to load video dataSource for calibration: ${e.message}", LogSeverity.ERROR)
             return@withContext blurSpecs
         }
 
@@ -112,13 +113,13 @@ class ObjectAnchorCalibrator(
             return@withContext indicators
         }
 
-        ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Starting Script-Mode Auto-Fix calibration for ${activeIndicators.size} tracking indicator(s)...", LogSeverity.INFO)
+        logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Starting Script-Mode Auto-Fix calibration for ${activeIndicators.size} tracking indicator(s)...", LogSeverity.INFO)
 
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(videoFile.absolutePath)
         } catch (e: Exception) {
-            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Failed to load video dataSource for tracking calibration: ${e.message}", LogSeverity.ERROR)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Failed to load video dataSource for tracking calibration: ${e.message}", LogSeverity.ERROR)
             return@withContext indicators
         }
 
@@ -157,7 +158,7 @@ class ObjectAnchorCalibrator(
             }
 
             if (detectedBounds != null) {
-                ProcessingLogger.log(
+                logger.log(
                     "CALIBRATION",
                     PipelineStatus.EXPORTING,
                     "🎯 [SNAP-AUTOFIX] Blur target '${spec.targetType}' at ${spec.startTimeMs}ms snapped: " +
@@ -167,7 +168,7 @@ class ObjectAnchorCalibrator(
                 )
                 spec.copy(bounds = detectedBounds)
             } else {
-                ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] No physical candidate within proximity for blur at ${spec.startTimeMs}ms. Preserving Gemini script bounds.", LogSeverity.INFO)
+                logger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] No physical candidate within proximity for blur at ${spec.startTimeMs}ms. Preserving Gemini script bounds.", LogSeverity.INFO)
                 spec
             }
         } finally {
@@ -219,7 +220,7 @@ class ObjectAnchorCalibrator(
                 }
             }
 
-            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "🎯 [SNAP-AUTOFIX] Calibrated ${calibratedKeyframes.size} keyframes for target '${indicator.id}'", LogSeverity.SUCCESS)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "🎯 [SNAP-AUTOFIX] Calibrated ${calibratedKeyframes.size} keyframes for target '${indicator.id}'", LogSeverity.SUCCESS)
             indicator.copy(keyframes = calibratedKeyframes)
         } else {
             // Calibrate static bounds
@@ -234,7 +235,7 @@ class ObjectAnchorCalibrator(
                 }
 
                 if (detectedBounds != null) {
-                    ProcessingLogger.log(
+                    logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
                         "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) snapped to physical target at ${indicator.startTimeMs}ms",
@@ -242,7 +243,7 @@ class ObjectAnchorCalibrator(
                     )
                     indicator.copy(staticBounds = detectedBounds)
                 } else {
-                    ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] Indicator '${indicator.id}' preserved Gemini script bounds.", LogSeverity.INFO)
+                    logger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] Indicator '${indicator.id}' preserved Gemini script bounds.", LogSeverity.INFO)
                     indicator
                 }
             } finally {
@@ -280,7 +281,7 @@ class ObjectAnchorCalibrator(
             }
             bestFaceBounds
         } catch (e: Exception) {
-            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Face detection error: ${e.message}", LogSeverity.ERROR)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Face detection error: ${e.message}", LogSeverity.ERROR)
             null
         }
     }
@@ -322,7 +323,7 @@ class ObjectAnchorCalibrator(
             }
             bestObjectBounds
         } catch (e: Exception) {
-            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Object detection error: ${e.message}", LogSeverity.ERROR)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Object detection error: ${e.message}", LogSeverity.ERROR)
             null
         }
     }
@@ -335,7 +336,7 @@ class ObjectAnchorCalibrator(
         return try {
             retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
         } catch (e: Exception) {
-            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Unable to extract frame at ${timeUs / 1000}ms: ${e.message}", LogSeverity.WARNING)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Unable to extract frame at ${timeUs / 1000}ms: ${e.message}", LogSeverity.WARNING)
             null
         }
     }
