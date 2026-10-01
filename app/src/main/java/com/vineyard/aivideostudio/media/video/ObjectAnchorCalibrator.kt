@@ -3,7 +3,6 @@ package com.vineyard.aivideostudio.media.video
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
-import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
@@ -13,17 +12,15 @@ import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.objects.DetectedObject
 import com.google.mlkit.vision.objects.ObjectDetection
 import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import com.vineyard.aivideostudio.core.model.PipelineStatus
 import com.vineyard.aivideostudio.core.model.effects.BlurSpec
 import com.vineyard.aivideostudio.core.model.effects.NormalizedBounds
 import com.vineyard.aivideostudio.core.model.effects.TrackingIndicatorSpec
-import com.vineyard.aivideostudio.core.model.effects.TrackingKeyframe
+import com.vineyard.aivideostudio.processing.logger.LogSeverity
 import com.vineyard.aivideostudio.processing.logger.ProcessingLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
 
 /**
  * On-device calibrator for physical objects and human faces in Script Mode.
@@ -37,7 +34,6 @@ class ObjectAnchorCalibrator(
 ) {
 
     companion object {
-        private const val TAG = "ObjectAnchorCalibrator"
         private const val PROXIMITY_SNAP_THRESHOLD = 0.35f // Max normalized distance allowed for magnetic snap
     }
 
@@ -75,13 +71,13 @@ class ObjectAnchorCalibrator(
             return@withContext blurSpecs
         }
 
-        ProcessingLogger.i(TAG, "Starting Script-Mode Auto-Fix calibration for ${activeSpecs.size} blur target(s)...")
+        ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Starting Script-Mode Auto-Fix calibration for ${activeSpecs.size} blur target(s)...", LogSeverity.INFO)
 
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(videoFile.absolutePath)
         } catch (e: Exception) {
-            ProcessingLogger.e(TAG, "Failed to load video dataSource for calibration: ${e.message}")
+            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Failed to load video dataSource for calibration: ${e.message}", LogSeverity.ERROR)
             return@withContext blurSpecs
         }
 
@@ -116,13 +112,13 @@ class ObjectAnchorCalibrator(
             return@withContext indicators
         }
 
-        ProcessingLogger.i(TAG, "Starting Script-Mode Auto-Fix calibration for ${activeIndicators.size} tracking indicator(s)...")
+        ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Starting Script-Mode Auto-Fix calibration for ${activeIndicators.size} tracking indicator(s)...", LogSeverity.INFO)
 
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(videoFile.absolutePath)
         } catch (e: Exception) {
-            ProcessingLogger.e(TAG, "Failed to load video dataSource for tracking calibration: ${e.message}")
+            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Failed to load video dataSource for tracking calibration: ${e.message}", LogSeverity.ERROR)
             return@withContext indicators
         }
 
@@ -161,15 +157,17 @@ class ObjectAnchorCalibrator(
             }
 
             if (detectedBounds != null) {
-                ProcessingLogger.i(
-                    TAG,
+                ProcessingLogger.log(
+                    "CALIBRATION",
+                    PipelineStatus.EXPORTING,
                     "🎯 [SNAP-AUTOFIX] Blur target '${spec.targetType}' at ${spec.startTimeMs}ms snapped: " +
                             "L:${"%.3f".format(spec.bounds.left)}->${"%.3f".format(detectedBounds.left)}, " +
-                            "T:${"%.3f".format(spec.bounds.top)}->${"%.3f".format(detectedBounds.top)}"
+                            "T:${"%.3f".format(spec.bounds.top)}->${"%.3f".format(detectedBounds.top)}",
+                    LogSeverity.SUCCESS
                 )
                 spec.copy(bounds = detectedBounds)
             } else {
-                ProcessingLogger.d(TAG, "⚠️ [SNAP-FALLBACK] No physical candidate within proximity for blur at ${spec.startTimeMs}ms. Preserving Gemini script bounds.")
+                ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] No physical candidate within proximity for blur at ${spec.startTimeMs}ms. Preserving Gemini script bounds.", LogSeverity.INFO)
                 spec
             }
         } finally {
@@ -221,7 +219,7 @@ class ObjectAnchorCalibrator(
                 }
             }
 
-            ProcessingLogger.i(TAG, "🎯 [SNAP-AUTOFIX] Calibrated ${calibratedKeyframes.size} keyframes for target '${indicator.id}'")
+            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "🎯 [SNAP-AUTOFIX] Calibrated ${calibratedKeyframes.size} keyframes for target '${indicator.id}'", LogSeverity.SUCCESS)
             indicator.copy(keyframes = calibratedKeyframes)
         } else {
             // Calibrate static bounds
@@ -236,13 +234,15 @@ class ObjectAnchorCalibrator(
                 }
 
                 if (detectedBounds != null) {
-                    ProcessingLogger.i(
-                        TAG,
-                        "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) snapped to physical target at ${indicator.startTimeMs}ms"
+                    ProcessingLogger.log(
+                        "CALIBRATION",
+                        PipelineStatus.EXPORTING,
+                        "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) snapped to physical target at ${indicator.startTimeMs}ms",
+                        LogSeverity.SUCCESS
                     )
                     indicator.copy(staticBounds = detectedBounds)
                 } else {
-                    ProcessingLogger.d(TAG, "⚠️ [SNAP-FALLBACK] Indicator '${indicator.id}' preserved Gemini script bounds.")
+                    ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] Indicator '${indicator.id}' preserved Gemini script bounds.", LogSeverity.INFO)
                     indicator
                 }
             } finally {
@@ -280,7 +280,7 @@ class ObjectAnchorCalibrator(
             }
             bestFaceBounds
         } catch (e: Exception) {
-            ProcessingLogger.e(TAG, "ML Kit Face detection error: ${e.message}")
+            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Face detection error: ${e.message}", LogSeverity.ERROR)
             null
         }
     }
@@ -322,7 +322,7 @@ class ObjectAnchorCalibrator(
             }
             bestObjectBounds
         } catch (e: Exception) {
-            ProcessingLogger.e(TAG, "ML Kit Object detection error: ${e.message}")
+            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Object detection error: ${e.message}", LogSeverity.ERROR)
             null
         }
     }
@@ -335,7 +335,7 @@ class ObjectAnchorCalibrator(
         return try {
             retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
         } catch (e: Exception) {
-            ProcessingLogger.w(TAG, "Unable to extract frame at ${timeUs / 1000}ms: ${e.message}")
+            ProcessingLogger.log("CALIBRATION", PipelineStatus.EXPORTING, "Unable to extract frame at ${timeUs / 1000}ms: ${e.message}", LogSeverity.WARNING)
             null
         }
     }
