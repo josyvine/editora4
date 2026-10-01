@@ -125,6 +125,10 @@ dependencies {
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
+
+  // Google ML Kit On-Device Text Recognition for UI Magnetic Snapping
+  implementation("com.google.mlkit:text-recognition:16.0.1")
+
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
