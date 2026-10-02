@@ -19,17 +19,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
+import kotlin.math.abs
 import kotlin.math.hypot
 
 object OcrAnchorCalibrator {
 
     private const val TAG = "OcrAnchorCalibrator"
-    private const val MAX_SEARCH_RADIUS_NORMALIZED = 0.30f // Search within 30% of estimated area
+    private const val MAX_SEARCH_RADIUS_NORMALIZED = 0.38f // Search within 38% radius of target zone
 
     /**
      * Universally calibrates tracking indicators for any video:
      * 1. Inspects video frames at trigger times.
-     * 2. Finds matching text blocks near the estimated coordinates.
+     * 2. Finds matching text lines/blocks near the estimated coordinates.
      * 3. Snaps bounding boxes directly to the real UI targets with zero human script editing.
      * 4. Dispatches full real-time diagnostic telemetry to the in-app log console.
      */
@@ -91,7 +92,7 @@ object OcrAnchorCalibrator {
                     continue
                 }
 
-                // 1. Extract snapshot frame at the indicator's trigger millisecond
+                // 1. Extract snapshot frame at the indicator's raw trigger millisecond
                 val timeUs = (indicator.startTimeMs * 1000L).coerceAtLeast(0L)
                 val frameBitmap = try {
                     retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
@@ -108,7 +109,7 @@ object OcrAnchorCalibrator {
                 val frameW = frameBitmap.width.toFloat().coerceAtLeast(1f)
                 val frameH = frameBitmap.height.toFloat().coerceAtLeast(1f)
 
-                // 2. Resolve estimated center point from script
+                // 2. Resolve estimated center point from script bounds
                 val hintCenterX = indicator.staticBounds?.centerX ?: 0.5f
                 val hintCenterY = indicator.staticBounds?.centerY ?: 0.5f
 
@@ -116,7 +117,7 @@ object OcrAnchorCalibrator {
                     logger.log(
                         projectId,
                         PipelineStatus.EXPORTING,
-                        "Scanning frame at ${indicator.startTimeMs}ms for on-screen anchor '$anchorQuery'...",
+                        "Scanning frame at ${indicator.startTimeMs}ms for on-screen anchor '$anchorQuery' near (X:${"%.2f".format(hintCenterX)}, Y:${"%.2f".format(hintCenterY)})...",
                         LogSeverity.INFO
                     )
                 }
@@ -134,24 +135,25 @@ object OcrAnchorCalibrator {
 
                 if (matchedRect != null) {
                     // 4. Calculate universal padded bounds
-                    val padX = (matchedRect.width() * 0.12f).coerceAtLeast(20f)
-                    val padY = (matchedRect.height() * 0.15f).coerceAtLeast(14f)
+                    val padX = (matchedRect.width() * 0.10f).coerceAtLeast(16f)
+                    val padY = (matchedRect.height() * 0.12f).coerceAtLeast(12f)
 
-                    // Expand right edge if target is an interactive toggle row
-                    val isToggleRow = anchorQuery.contains("Grounding", ignoreCase = true) ||
-                            anchorQuery.contains("context", ignoreCase = true) ||
-                            anchorQuery.contains("Search", ignoreCase = true) ||
-                            anchorQuery.contains("model", ignoreCase = true)
+                    // Expand right edge if target is an interactive toggle row or settings item
+                    val isToggleRow = anchorQuery.contains("all models", ignoreCase = true) ||
+                            anchorQuery.contains("Grounding", ignoreCase = true) ||
+                            anchorQuery.contains("Search", ignoreCase = true)
 
-                    val expandRight = if (isToggleRow) (frameW * 0.22f) else padX
+                    val expandRight = if (isToggleRow) (frameW * 0.18f) else padX
 
                     val snappedLeft = ((matchedRect.left - padX) / frameW).coerceIn(0.0f, 1.0f)
                     val snappedTop = ((matchedRect.top - padY) / frameH).coerceIn(0.0f, 1.0f)
-                    val snappedRight = ((matchedRect.right + expandRight) / frameW).coerceIn(snappedLeft + 0.05f, 1.0f)
+                    val snappedRight = ((matchedRect.right + expandRight) / frameW).coerceIn(snappedLeft + 0.04f, 1.0f)
                     val snappedBottom = ((matchedRect.bottom + padY) / frameH).coerceIn(snappedTop + 0.02f, 1.0f)
 
-                    val logMsg = "[OCR_AUTOFIX] Snapped '${indicator.id}' ['$anchorQuery'] " +
-                            "from Script Y=${"%.2f".format(indicator.staticBounds?.top ?: 0f)} -> Real Text Y=${"%.2f".format(snappedTop)}"
+                    val scriptTop = indicator.staticBounds?.top ?: 0f
+                    val deltaY = snappedTop - scriptTop
+                    val logMsg = "🎯 [OCR_AUTOFIX] Snapped '${indicator.id}' ['$anchorQuery'] " +
+                            "Script Y=${"%.2f".format(scriptTop)} -> Real Text Y=${"%.2f".format(snappedTop)} (ΔY=${"%.2f".format(deltaY)})"
 
                     Log.i(TAG, logMsg)
                     if (projectId != null && logger != null) {
@@ -182,7 +184,7 @@ object OcrAnchorCalibrator {
                         logger.log(
                             projectId,
                             PipelineStatus.EXPORTING,
-                            "Anchor text '$anchorQuery' not detected on frame, retaining script bounds [T=${"%.2f".format(indicator.staticBounds?.top ?: 0f)}]",
+                            "Anchor text '$anchorQuery' not detected near target zone, retaining script bounds [T=${"%.2f".format(indicator.staticBounds?.top ?: 0f)}]",
                             LogSeverity.INFO
                         )
                     }
@@ -212,8 +214,9 @@ object OcrAnchorCalibrator {
     }
 
     /**
-     * Finds the closest matching text block to the estimated target coordinates,
-     * handling multi-line text wrapping and rejecting far-away false positives.
+     * Finds the closest matching text element with priority given to individual lines first,
+     * preventing whole multi-row blocks from being mistakenly highlighted.
+     * Enforces strict spatial proximity to eliminate faraway duplicate words (e.g. prompt text vs. bottom action button).
      */
     private fun findBestMatchingBlock(
         ocrText: Text?,
@@ -225,51 +228,74 @@ object OcrAnchorCalibrator {
     ): Rect? {
         if (ocrText == null || query.isBlank()) return null
         val cleanQuery = query.lowercase().replace("_", " ").trim()
-        val queryKeywords = cleanQuery.split(" ").filter { it.length > 2 }
+        val queryKeywords = cleanQuery.split(" ").filter { it.length > 1 }
 
         var bestRect: Rect? = null
         var bestScore = -1f
 
+        // PASS 1: Search individual Lines first for pinpoint single-row precision
+        for (block in ocrText.textBlocks) {
+            for (line in block.lines) {
+                val lineBox = line.boundingBox ?: continue
+                val lineNormCenterX = lineBox.exactCenterX() / frameWidth
+                val lineNormCenterY = lineBox.exactCenterY() / frameHeight
+
+                val distance = hypot(lineNormCenterX - hintCenterX, lineNormCenterY - hintCenterY)
+                if (distance > MAX_SEARCH_RADIUS_NORMALIZED) {
+                    continue
+                }
+
+                val lineText = line.text.lowercase().trim()
+
+                // Exact line phrase match
+                if (lineText.contains(cleanQuery)) {
+                    val proximityBonus = (1.0f - (distance / MAX_SEARCH_RADIUS_NORMALIZED)).coerceIn(0.1f, 1.0f)
+                    val score = 2.0f + proximityBonus
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestRect = lineBox
+                    }
+                    continue
+                }
+
+                // Keyword overlap match on line
+                val keywordMatches = queryKeywords.count { lineText.contains(it) }
+                if (keywordMatches > 0) {
+                    val matchRatio = keywordMatches.toFloat() / queryKeywords.size.coerceAtLeast(1)
+                    val proximityBonus = (1.0f - (distance / MAX_SEARCH_RADIUS_NORMALIZED)).coerceIn(0.1f, 1.0f)
+                    val score = (matchRatio * 1.5f) + (proximityBonus * 0.5f)
+
+                    if (score > bestScore && matchRatio >= 0.5f) {
+                        bestScore = score
+                        bestRect = lineBox
+                    }
+                }
+            }
+        }
+
+        if (bestRect != null) {
+            return bestRect
+        }
+
+        // PASS 2: Fallback to TextBlocks if text is wrapped across lines
         for (block in ocrText.textBlocks) {
             val blockBox = block.boundingBox ?: continue
-            val blockNormCenterX = (blockBox.exactCenterX()) / frameWidth
-            val blockNormCenterY = (blockBox.exactCenterY()) / frameHeight
+            val blockNormCenterX = blockBox.exactCenterX() / frameWidth
+            val blockNormCenterY = blockBox.exactCenterY() / frameHeight
 
-            // Proximity Filter: Only consider elements within the target neighborhood
             val distance = hypot(blockNormCenterX - hintCenterX, blockNormCenterY - hintCenterY)
-            if (distance > MAX_SEARCH_RADIUS_NORMALIZED && hintCenterX != 0.5f) {
+            if (distance > MAX_SEARCH_RADIUS_NORMALIZED) {
                 continue
             }
 
             val unifiedBlockText = block.text.replace("\n", " ").lowercase()
 
-            // 1. Exact phrase match inside block
             if (unifiedBlockText.contains(cleanQuery)) {
-                return blockBox
-            }
-
-            // 2. Keyword overlap match
-            val keywordMatches = queryKeywords.count { unifiedBlockText.contains(it) }
-            if (keywordMatches > 0) {
-                val matchRatio = keywordMatches.toFloat() / queryKeywords.size.coerceAtLeast(1)
-                val proximityWeight = (1.0f - (distance / MAX_SEARCH_RADIUS_NORMALIZED)).coerceIn(0.1f, 1.0f)
-                val score = (matchRatio * 0.7f) + (proximityWeight * 0.3f)
-
-                if (score > bestScore && matchRatio >= 0.5f) {
+                val proximityBonus = (1.0f - (distance / MAX_SEARCH_RADIUS_NORMALIZED)).coerceIn(0.1f, 1.0f)
+                val score = 1.0f + proximityBonus
+                if (score > bestScore) {
                     bestScore = score
                     bestRect = blockBox
-                }
-            }
-
-            // 3. Line-level check inside block for single-line targets
-            for (line in block.lines) {
-                val lineText = line.text.lowercase()
-                val lineBox = line.boundingBox ?: continue
-                val lineNormCenterY = lineBox.exactCenterY() / frameHeight
-                val lineDist = kotlin.math.abs(lineNormCenterY - hintCenterY)
-
-                if (lineText.contains(cleanQuery) && lineDist <= MAX_SEARCH_RADIUS_NORMALIZED) {
-                    return lineBox
                 }
             }
         }
