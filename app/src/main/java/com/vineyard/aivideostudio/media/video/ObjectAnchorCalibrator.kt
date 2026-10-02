@@ -27,8 +27,8 @@ import kotlin.math.min
 /**
  * On-device calibrator for physical objects and human faces in Script Mode.
  *
- * Takes Gemini Vision's initial semantic hypothesis from the Master Recipe JSON script,
- * samples the actual uncompressed video frame at the trigger timestamp, runs on-device
+ * Takes Gemini Vision's grounded hypothesis from the Live WebSocket stream,
+ * samples uncompressed video frames at trigger timestamps, runs on-device
  * ML Kit detection, and magnetically snaps coordinates to physical pixel edges.
  */
 class ObjectAnchorCalibrator(
@@ -37,7 +37,9 @@ class ObjectAnchorCalibrator(
 ) {
 
     companion object {
-        private const val PROXIMITY_SNAP_THRESHOLD = 0.35f // Max normalized distance allowed for magnetic snap
+        private const val FACE_SNAP_THRESHOLD = 0.25f // Max distance allowed for face contour magnetic snap
+        private const val OBJECT_MAX_DRIFT_THRESHOLD = 0.12f // Strict max drift to prevent jumping onto background furniture
+        private const val OBJECT_MIN_IOU_THRESHOLD = 0.15f // Minimum overlap required to accept an ML Kit object snap
     }
 
     // High accuracy face detector for precise contour bounding
@@ -184,13 +186,11 @@ class ObjectAnchorCalibrator(
         }
 
         return if (detectedBoxes.isNotEmpty()) {
-            // Build an expanded spatial envelope covering initial position + downward/lateral movement
             var minLeft = detectedBoxes.minOf { it.left }
             var minTop = detectedBoxes.minOf { it.top }
             var maxRight = detectedBoxes.maxOf { it.right }
             var maxBottom = detectedBoxes.maxOf { it.bottom }
 
-            // Add safe padding to guarantee full head coverage during motion
             val padX = (maxRight - minLeft) * 0.10f
             val padY = (maxBottom - minTop) * 0.10f
             minLeft = (minLeft - padX).coerceIn(0.0f, 1.0f)
@@ -221,7 +221,6 @@ class ObjectAnchorCalibrator(
         val isKeyframes = indicator.trackingMode.equals("keyframes", ignoreCase = true) && !indicator.keyframes.isNullOrEmpty()
 
         return if (isKeyframes) {
-            // Calibrate each keyframe against real physical coordinates at that exact second
             val calibratedKeyframes = indicator.keyframes!!.map { kf ->
                 val frameBitmap = extractFrame(retriever, kf.timeMs * 1000L) ?: return@map kf
                 try {
@@ -275,12 +274,17 @@ class ObjectAnchorCalibrator(
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) snapped to physical target at ${indicator.startTimeMs}ms",
+                        "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) tightened to physical edges at ${indicator.startTimeMs}ms",
                         LogSeverity.SUCCESS
                     )
                     indicator.copy(staticBounds = detectedBounds)
                 } else {
-                    logger.log("CALIBRATION", PipelineStatus.EXPORTING, "⚠️ [SNAP-FALLBACK] Indicator '${indicator.id}' locked to Vision anchor bounds.", LogSeverity.INFO)
+                    logger.log(
+                        "CALIBRATION",
+                        PipelineStatus.EXPORTING,
+                        "🔒 [ANCHOR-LOCK] Indicator '${indicator.id}' (${indicator.label}) locked firmly to Gemini Vision anchor (furniture distraction rejected).",
+                        LogSeverity.INFO
+                    )
                     indicator
                 }
             } finally {
@@ -290,7 +294,7 @@ class ObjectAnchorCalibrator(
     }
 
     // ---------------------------------------------------------------------------------------------
-    // ML Kit Detection & Proximity Filtering
+    // ML Kit Detection & Proximity / IoU Gating
     // ---------------------------------------------------------------------------------------------
 
     private fun detectClosestFace(bitmap: Bitmap, scriptBounds: NormalizedBounds): NormalizedBounds? {
@@ -310,7 +314,7 @@ class ObjectAnchorCalibrator(
             for (face in faces) {
                 val normBounds = face.boundingBox.toNormalizedBounds(width, height)
                 val dist = calculateDistance(normBounds, scriptBounds)
-                if (dist < minDistance && dist <= PROXIMITY_SNAP_THRESHOLD) {
+                if (dist < minDistance && dist <= FACE_SNAP_THRESHOLD) {
                     minDistance = dist
                     bestFaceBounds = normBounds
                 }
@@ -322,9 +326,13 @@ class ObjectAnchorCalibrator(
         }
     }
 
+    /**
+     * Inspects on-device objects using strict IoU overlap gating against Gemini Vision's anchor.
+     * Prevents ML Kit from snapping onto nearby furniture, shelves, or walls.
+     */
     private fun detectClosestObject(
         bitmap: Bitmap,
-        scriptBounds: NormalizedBounds,
+        anchorBounds: NormalizedBounds,
         expectedClass: String?
     ): NormalizedBounds? {
         val image = InputImage.fromBitmap(bitmap, 0)
@@ -332,25 +340,35 @@ class ObjectAnchorCalibrator(
             val task = objectDetector.process(image)
             val detectedObjects: List<DetectedObject> = Tasks.await(task)
 
+            if (detectedObjects.isEmpty()) return null
+
             val width = bitmap.width.toFloat()
             val height = bitmap.height.toFloat()
 
             var bestObjectBounds: NormalizedBounds? = null
+            var bestIoU = 0.0f
             var minDistance = Float.MAX_VALUE
 
             for (obj in detectedObjects) {
                 val normBounds = obj.boundingBox.toNormalizedBounds(width, height)
-                val dist = calculateDistance(normBounds, scriptBounds)
+                val dist = calculateDistance(normBounds, anchorBounds)
+                val iou = calculateIoU(normBounds, anchorBounds)
+
+                // Reject objects that do not overlap the anchor or drift too far into surrounding furniture
+                if (dist > OBJECT_MAX_DRIFT_THRESHOLD && iou < OBJECT_MIN_IOU_THRESHOLD) {
+                    continue
+                }
 
                 var weight = 1.0f
                 if (!expectedClass.isNullOrBlank()) {
                     val hasLabelMatch = obj.labels.any { it.text.contains(expectedClass, ignoreCase = true) }
-                    if (hasLabelMatch) weight = 0.7f
+                    if (hasLabelMatch) weight = 0.6f // Prioritize category match
                 }
 
-                val finalScore = dist * weight
-                if (finalScore < minDistance && dist <= PROXIMITY_SNAP_THRESHOLD) {
-                    minDistance = finalScore
+                val score = (dist * weight) - (iou * 0.5f)
+                if (score < minDistance && (iou >= OBJECT_MIN_IOU_THRESHOLD || dist <= OBJECT_MAX_DRIFT_THRESHOLD)) {
+                    minDistance = score
+                    bestIoU = iou
                     bestObjectBounds = normBounds
                 }
             }
@@ -392,5 +410,25 @@ class ObjectAnchorCalibrator(
         val dx = centerAx - centerBx
         val dy = centerAy - centerBy
         return kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+    }
+
+    /**
+     * Calculates Intersection-over-Union (IoU) between two bounding boxes.
+     */
+    private fun calculateIoU(a: NormalizedBounds, b: NormalizedBounds): Float {
+        val interLeft = max(a.left, b.left)
+        val interTop = max(a.top, b.top)
+        val interRight = min(a.right, b.right)
+        val interBottom = min(a.bottom, b.bottom)
+
+        val interWidth = max(0.0f, interRight - interLeft)
+        val interHeight = max(0.0f, interBottom - interTop)
+        val interArea = interWidth * interHeight
+
+        val areaA = (a.right - a.left) * (a.bottom - a.top)
+        val areaB = (b.right - b.left) * (b.bottom - b.top)
+        val unionArea = areaA + areaB - interArea
+
+        return if (unionArea > 0.0f) interArea / unionArea else 0.0f
     }
 }
