@@ -434,7 +434,7 @@ class VideoProcessingPipeline(
         projectRepository.saveCaptions(projectId, captionsToSave)
         recordStep(projectId, PipelineStatus.CAPTION_ANALYSIS, StepStatus.COMPLETED, "${captionsToSave.size} captions configured")
 
-        // 8. COMMENTARY (Auto Mode: Always single unified track)
+        // 8. COMMENTARY (Auto Mode: Always single unified track - 100% UNTOUCHED)
         onStageChanged(PipelineStatus.COMMENTARY_ANALYSIS, "Gemini composing voiceover script (${String.format("%.1f", currentDuration)}s)")
         recordStep(projectId, PipelineStatus.COMMENTARY_ANALYSIS, StepStatus.IN_PROGRESS, "Composing commentary")
 
@@ -1241,6 +1241,7 @@ class VideoProcessingPipeline(
 
     /**
      * Synthesizes an individual cue segment to a temporary PCM file based on selected engine.
+     * Uses dynamic JSON tone/persona in Script Mode.
      */
     private suspend fun synthesizeSingleCueToPcm(
         projectId: String,
@@ -1255,7 +1256,14 @@ class VideoProcessingPipeline(
 
         if (isLiveEngine) {
             val segPcmFile = storageManager.createAudioOutputFile(projectId, "seg_${idx}_raw.pcm")
-            val verbatimPrompt = "You are a professional studio voiceover narrator. Recite the following script verbatim. Do not add any conversational remarks, introductions, or greetings. Tone: ${tone ?: "Clear professional narrator"}"
+            
+            // Dynamic Persona Prompt: Uses the exact character instruction provided in the Master JSON
+            val characterPersona = if (!tone.isNullOrBlank()) {
+                "$tone. Recite the following script verbatim."
+            } else {
+                "You are a professional studio voiceover narrator. Recite the following script verbatim."
+            }
+            val verbatimPrompt = "$characterPersona Do not add any conversational remarks, introductions, or greetings."
 
             val segTtsResult = liveCommentatorManager.generateLiveCommentary(
                 scriptText = seg.text,
@@ -1307,7 +1315,14 @@ class VideoProcessingPipeline(
 
         if (isLiveEngine) {
             val livePcmFile = storageManager.createAudioOutputFile(projectId, "commentary_live_raw.pcm")
-            val verbatimPrompt = "You are a professional studio voiceover narrator. Recite the following script verbatim. Do not add any conversational remarks, introductions, or greetings. Tone: ${tone ?: "Clear professional narrator"}"
+            
+            // Dynamic Persona Prompt: Uses the exact character instruction provided in the Master JSON
+            val characterPersona = if (!tone.isNullOrBlank()) {
+                "$tone. Recite the following script verbatim."
+            } else {
+                "You are a professional studio voiceover narrator. Recite the following script verbatim."
+            }
+            val verbatimPrompt = "$characterPersona Do not add any conversational remarks, introductions, or greetings."
 
             val liveResult = liveCommentatorManager.generateLiveCommentary(
                 scriptText = script,
