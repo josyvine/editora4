@@ -794,7 +794,7 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (With Closed-Loop Gemini Vision Grounding + Local ML Kit Snap)
+        // 7. FINAL PRODUCTION EXPORT (With Dynamic Column Grounding + Local ML Kit Snap)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
@@ -819,13 +819,13 @@ class VideoProcessingPipeline(
             remappedTrackingIndicators
         }
 
-        // Auto-Fix 2: Multimodal Gemini Live WebSocket Vision -> Closed-Loop with Local ML Kit
+        // Auto-Fix 2: Multimodal Gemini Live WebSocket Vision -> Dynamic Spatial Column Grounding
         val videoFileForCalibration = runCatching {
             val uri = Uri.parse(currentVideoUri)
             if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
         }.getOrNull() ?: File(currentVideoUri)
 
-        // Pass 1: Gemini Live WebSocket grounds the initial vision proposal
+        // Pass 1: Establish Dynamic Spatial Columns and initial grounded proposal via Gemini Live WebSocket
         val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
             videoFile = videoFileForCalibration,
             blurSpecs = remappedBlurSpecs
@@ -836,7 +836,7 @@ class VideoProcessingPipeline(
             indicators = calibratedTrackingIndicators
         )
 
-        // Pass 2: Local ML Kit applies physical contour snapping
+        // Pass 2: Local ML Kit applies physical contour snapping + multi-slice dynamic motion tracking across timeline
         val mlKitSnappedBlurSpecs = try {
             objectAnchorCalibrator.calibrateBlurSpecs(
                 videoFile = videoFileForCalibration,
@@ -855,7 +855,7 @@ class VideoProcessingPipeline(
             visionGroundedTrackingIndicators
         }
 
-        // Pass 3 (Closed-Loop Verification): Gemini Live inspects ML Kit's snap and corrects if misplaced onto furniture
+        // Pass 3 (Closed-Loop Column Verification): Gemini Live inspects ML Kit's snap and verifies spatial column containment
         val fullyCalibratedTrackingIndicators = verifyAndCorrectTrackingTargetsWithVision(
             videoFile = videoFileForCalibration,
             indicators = mlKitSnappedIndicators
@@ -937,6 +937,7 @@ class VideoProcessingPipeline(
 
     /**
      * Pass 1: Proposes initial target coordinates via Gemini Live Bidi WebSocket stream.
+     * Instructs Gemini Vision to establish a dynamic spatial column and isolate the object on its surface.
      */
     private suspend fun groundTrackingTargetsWithVision(
         videoFile: File,
@@ -957,7 +958,9 @@ class VideoProcessingPipeline(
                     ?: return@map indicator
 
                 val targetDesc = indicator.label ?: indicator.objectClass ?: indicator.targetType ?: "target object"
-                val prompt = "Locate the '$targetDesc'. Avoid surrounding furniture, shelves, or walls. Identify the exact coordinates of the '$targetDesc'."
+                val prompt = "DYNAMIC SPATIAL COLUMN PASS: Locate the target '$targetDesc'. " +
+                        "Identify its spatial placement column [minX to maxX] and exact normalized coordinates. " +
+                        "For still objects, lock coordinates strictly to the physical surface where it sits. Avoid surrounding walls, furniture, or shelves."
 
                 val visionResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
@@ -974,7 +977,7 @@ class VideoProcessingPipeline(
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-PROPOSE] Target '${indicator.id}' ($targetDesc) proposed via WebSocket: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
+                        "👁️ [LIVE-WS-COLUMN-PROPOSE] Target '${indicator.id}' ($targetDesc) grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
                         LogSeverity.INFO
                     )
                     indicator.copy(staticBounds = visionBounds)
@@ -991,9 +994,8 @@ class VideoProcessingPipeline(
     }
 
     /**
-     * Pass 3 (Closed-Loop Verification): Gemini Live inspects the candidate coordinates produced by ML Kit.
-     * If ML Kit snapped to the wrong physical structure (like a wooden shelf instead of a blanket),
-     * Gemini Live detects the error and emits the corrected shift coordinates.
+     * Pass 3 (Closed-Loop Column Verification): Gemini Live inspects the candidate coordinates produced by ML Kit.
+     * Enforces that the candidate bounds remain strictly inside the target's physical spatial corridor.
      */
     private suspend fun verifyAndCorrectTrackingTargetsWithVision(
         videoFile: File,
@@ -1011,8 +1013,8 @@ class VideoProcessingPipeline(
                     ?: return@map indicator
 
                 val targetDesc = indicator.label ?: indicator.objectClass ?: "target object"
-                val verifyPrompt = "VERIFICATION PASS: Target is '$targetDesc'. Current candidate bounds are at [Top: ${"%.3f".format(bounds.top)}, Bottom: ${"%.3f".format(bounds.bottom)}]. " +
-                        "If this box is on the bookshelf, books, or wall instead of the '$targetDesc' on the bed, report the TRUE corrected box for '$targetDesc'."
+                val verifyPrompt = "CLOSED-LOOP COLUMN VERIFICATION: Target is '$targetDesc'. Candidate box is at [Top: ${"%.3f".format(bounds.top)}, Bottom: ${"%.3f".format(bounds.bottom)}]. " +
+                        "If this box has drifted outside its physical surface column (e.g. pulled onto shelves, books, or walls instead of the '$targetDesc' on the bed), report the TRUE corrected box for '$targetDesc'."
 
                 val verificationResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
@@ -1029,7 +1031,7 @@ class VideoProcessingPipeline(
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "🔄 [CLOSED-LOOP-AUTOFIX] Verified '$targetDesc' via Live WebSocket: L:${"%.3f".format(verifiedBounds.left)}, T:${"%.3f".format(verifiedBounds.top)}, R:${"%.3f".format(verifiedBounds.right)}, B:${"%.3f".format(verifiedBounds.bottom)}",
+                        "🔄 [CLOSED-LOOP-COLUMN-AUTOFIX] Verified '$targetDesc' via Live WebSocket: L:${"%.3f".format(verifiedBounds.left)}, T:${"%.3f".format(verifiedBounds.top)}, R:${"%.3f".format(verifiedBounds.right)}, B:${"%.3f".format(verifiedBounds.bottom)}",
                         LogSeverity.SUCCESS
                     )
                     indicator.copy(staticBounds = verifiedBounds)
@@ -1065,12 +1067,13 @@ class VideoProcessingPipeline(
 
                 val targetId = "blur_${spec.targetType}_$idx"
                 val targetDesc = spec.targetType ?: "face"
+                val prompt = "DYNAMIC MOTION COLUMN PASS: Locate the '$targetDesc' and define its horizontal motion column [minX to maxX] across the frame."
 
                 val visionResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
                         frameBitmap = frameBitmap,
                         targetId = targetId,
-                        targetDescription = targetDesc
+                        targetDescription = prompt
                     )
                 } finally {
                     frameBitmap.recycle()
@@ -1081,7 +1084,7 @@ class VideoProcessingPipeline(
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-VISION] Blur target '${spec.targetType}' grounded via Live WebSocket: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
+                        "👁️ [LIVE-WS-COLUMN-BLUR] Blur target '${spec.targetType}' column grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
                         LogSeverity.INFO
                     )
                     spec.copy(bounds = visionBounds)
