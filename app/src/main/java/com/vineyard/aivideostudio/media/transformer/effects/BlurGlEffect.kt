@@ -124,7 +124,7 @@ private class BlurGlShaderProgram(
                 sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, 0.0)) * 0.11;
                 sum += texture2D(uTexSampler, uv + vec2(texOffset.x, 0.0)) * 0.11;
                 sum += texture2D(uTexSampler, uv + vec2(0.0, -texOffset.y)) * 0.11;
-                sum += texture2D(uTexSampler, uv + vec2(0.0, texOffset.y)) * 0.11;
+                sum += texture2D(uTexSampler, uv + vec2(0.0, -texOffset.y)) * 0.11;
 
                 sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, -texOffset.y)) * 0.07;
                 sum += texture2D(uTexSampler, uv + vec2(texOffset.x, -texOffset.y)) * 0.07;
@@ -185,7 +185,7 @@ private class BlurGlShaderProgram(
             glProgram.setBufferAttribute(
                 "aFramePosition",
                 GlUtil.getNormalizedCoordinateBounds(),
-                GlUtil.HOMOUS_COORDINATE_VECTOR_SIZE ?: 4
+                GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE
             )
         } catch (e: Exception) {
             throw VideoFrameProcessingException("Failed to initialize BlurGlShaderProgram", e)
