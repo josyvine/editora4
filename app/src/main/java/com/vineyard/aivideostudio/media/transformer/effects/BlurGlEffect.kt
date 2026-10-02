@@ -42,8 +42,6 @@ private class BlurGlShaderProgram(
     private var currentHeight: Int = 1920
 
     companion object {
-        private const val MAX_CONCURRENT_BLURS = 8
-
         private const val VERTEX_SHADER = """
             attribute vec4 aFramePosition;
             varying vec2 vTexSamplingCoords;
@@ -57,38 +55,54 @@ private class BlurGlShaderProgram(
             precision mediump float;
             uniform sampler2D uTexSampler;
             varying vec2 vTexSamplingCoords;
-
             uniform vec2 uTexSize;
-            uniform float uActiveCount;
-            uniform float uShapes[$MAX_CONCURRENT_BLURS];      // 0.0: RECTANGLE, 1.0: CIRCLE, 2.0: FULL_FRAME
-            uniform float uTypes[$MAX_CONCURRENT_BLURS];       // 0.0: GAUSSIAN, 1.0: MOSAIC, 2.0: PRIVACY_BOX
-            uniform vec4 uBounds[$MAX_CONCURRENT_BLURS];     // x: left, y: top, z: right, w: bottom
-            uniform float uIntensities[$MAX_CONCURRENT_BLURS];
 
-            bool isInsideRegion(vec2 uv, int idx) {
+            // Slot 0
+            uniform int uActive0;
+            uniform int uShape0;
+            uniform int uType0;
+            uniform vec4 uBounds0;
+            uniform float uIntensity0;
+
+            // Slot 1
+            uniform int uActive1;
+            uniform int uShape1;
+            uniform int uType1;
+            uniform vec4 uBounds1;
+            uniform float uIntensity1;
+
+            // Slot 2
+            uniform int uActive2;
+            uniform int uShape2;
+            uniform int uType2;
+            uniform vec4 uBounds2;
+            uniform float uIntensity2;
+
+            // Slot 3
+            uniform int uActive3;
+            uniform int uShape3;
+            uniform int uType3;
+            uniform vec4 uBounds3;
+            uniform float uIntensity3;
+
+            bool checkInside(vec2 uv, int shape, vec4 b) {
                 float normY = 1.0 - uv.y;
                 float normX = uv.x;
-                float shape = uShapes[idx];
-                vec4 b = uBounds[idx];
 
-                if (shape > 1.5) { // 2.0: FULL_FRAME
+                if (shape == 2) { // FULL_FRAME
                     return true;
                 }
-                
-                if (shape < 0.5) { // 0.0: RECTANGLE
-                    return normX >= b.x && normX <= b.z &&
-                           normY >= b.y && normY <= b.w;
+                if (shape == 0) { // RECTANGLE
+                    return normX >= b.x && normX <= b.z && normY >= b.y && normY <= b.w;
                 }
-
-                if (shape >= 0.5 && shape <= 1.5) { // 1.0: CIRCLE / ELLIPSE
+                if (shape == 1) { // CIRCLE / ELLIPSE
                     vec2 center = vec2((b.x + b.z) * 0.5, (b.y + b.w) * 0.5);
-                    float radiusX = (b.z - b.x) * 0.5;
-                    float radiusY = (b.w - b.y) * 0.5;
-                    float normalizedDist = pow((normX - center.x) / max(radiusX, 0.001), 2.0) +
-                                           pow((normY - center.y) / max(radiusY, 0.001), 2.0);
-                    return normalizedDist <= 1.0;
+                    float rx = (b.z - b.x) * 0.5;
+                    float ry = (b.w - b.y) * 0.5;
+                    float dist = pow((normX - center.x) / max(rx, 0.001), 2.0) +
+                                 pow((normY - center.y) / max(ry, 0.001), 2.0);
+                    return dist <= 1.0;
                 }
-
                 return false;
             }
 
@@ -104,7 +118,7 @@ private class BlurGlShaderProgram(
                 vec2 texOffset = vec2(radius / uTexSize.x, radius / uTexSize.y);
                 
                 vec4 sum = vec4(0.0);
-                // 17-Tap Multi-Ring Heavy Privacy Obfuscation Convolution
+                // 17-Tap Multi-Ring Privacy Obfuscation Convolution
                 sum += texture2D(uTexSampler, uv) * 0.18;
 
                 sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, 0.0)) * 0.11;
@@ -117,7 +131,6 @@ private class BlurGlShaderProgram(
                 sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, texOffset.y)) * 0.07;
                 sum += texture2D(uTexSampler, uv + vec2(texOffset.x, texOffset.y)) * 0.07;
 
-                // Outer sampling ring for complete facial feature concealment
                 vec2 outerOffset = texOffset * 1.8;
                 sum += texture2D(uTexSampler, uv + vec2(-outerOffset.x, 0.0)) * 0.035;
                 sum += texture2D(uTexSampler, uv + vec2(outerOffset.x, 0.0)) * 0.035;
@@ -133,30 +146,32 @@ private class BlurGlShaderProgram(
             }
 
             void main() {
-                if (uActiveCount <= 0.5) {
-                    gl_FragColor = texture2D(uTexSampler, vTexSamplingCoords);
+                // Slot 0
+                if (uActive0 == 1 && checkInside(vTexSamplingCoords, uShape0, uBounds0)) {
+                    if (uType0 == 1) gl_FragColor = applyMosaic(vTexSamplingCoords, uIntensity0);
+                    else gl_FragColor = applyDenseGaussian(vTexSamplingCoords, uIntensity0);
                     return;
                 }
 
-                int activeLimit = int(uActiveCount + 0.5);
+                // Slot 1
+                if (uActive1 == 1 && checkInside(vTexSamplingCoords, uShape1, uBounds1)) {
+                    if (uType1 == 1) gl_FragColor = applyMosaic(vTexSamplingCoords, uIntensity1);
+                    else gl_FragColor = applyDenseGaussian(vTexSamplingCoords, uIntensity1);
+                    return;
+                }
 
-                // Check active blur regions simultaneously
-                for (int i = 0; i < $MAX_CONCURRENT_BLURS; i++) {
-                    if (i >= activeLimit) {
-                        break;
-                    }
+                // Slot 2
+                if (uActive2 == 1 && checkInside(vTexSamplingCoords, uShape2, uBounds2)) {
+                    if (uType2 == 1) gl_FragColor = applyMosaic(vTexSamplingCoords, uIntensity2);
+                    else gl_FragColor = applyDenseGaussian(vTexSamplingCoords, uIntensity2);
+                    return;
+                }
 
-                    if (isInsideRegion(vTexSamplingCoords, i)) {
-                        float blurType = uTypes[i];
-                        float intensity = uIntensities[i];
-
-                        if (blurType >= 0.5 && blurType <= 1.5) { // 1.0: MOSAIC
-                            gl_FragColor = applyMosaic(vTexSamplingCoords, intensity);
-                        } else { // 0.0: GAUSSIAN or 2.0: PRIVACY_BOX
-                            gl_FragColor = applyDenseGaussian(vTexSamplingCoords, intensity);
-                        }
-                        return;
-                    }
+                // Slot 3
+                if (uActive3 == 1 && checkInside(vTexSamplingCoords, uShape3, uBounds3)) {
+                    if (uType3 == 1) gl_FragColor = applyMosaic(vTexSamplingCoords, uIntensity3);
+                    else gl_FragColor = applyDenseGaussian(vTexSamplingCoords, uIntensity3);
+                    return;
                 }
 
                 gl_FragColor = texture2D(uTexSampler, vTexSamplingCoords);
@@ -170,7 +185,7 @@ private class BlurGlShaderProgram(
             glProgram.setBufferAttribute(
                 "aFramePosition",
                 GlUtil.getNormalizedCoordinateBounds(),
-                GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE
+                GlUtil.HOMOUS_COORDINATE_VECTOR_SIZE ?: 4
             )
         } catch (e: Exception) {
             throw VideoFrameProcessingException("Failed to initialize BlurGlShaderProgram", e)
@@ -190,43 +205,16 @@ private class BlurGlShaderProgram(
             val currentTimeMs = presentationTimeUs / 1000L
             val activeSpecs = blurSpecs.filter { spec ->
                 currentTimeMs in spec.startTimeMs..spec.endTimeMs
-            }.take(MAX_CONCURRENT_BLURS)
+            }.take(4)
 
-            val activeCount = activeSpecs.size
-            glProgram.setFloatUniform("uActiveCount", activeCount.toFloat())
-
-            val shapes = FloatArray(MAX_CONCURRENT_BLURS)
-            val types = FloatArray(MAX_CONCURRENT_BLURS)
-            val bounds = FloatArray(MAX_CONCURRENT_BLURS * 4)
-            val intensities = FloatArray(MAX_CONCURRENT_BLURS)
-
-            if (activeCount > 0) {
-                for (i in 0 until activeCount) {
-                    val spec = activeSpecs[i]
-                    shapes[i] = when (spec.shape) {
-                        BlurShape.RECTANGLE -> 0.0f
-                        BlurShape.CIRCLE -> 1.0f
-                        BlurShape.FULL_FRAME -> 2.0f
-                    }
-                    types[i] = when (spec.type) {
-                        BlurType.GAUSSIAN -> 0.0f
-                        BlurType.MOSAIC -> 1.0f
-                        BlurType.PRIVACY_BOX -> 2.0f
-                    }
-                    val offset = i * 4
-                    bounds[offset] = spec.bounds.left
-                    bounds[offset + 1] = spec.bounds.top
-                    bounds[offset + 2] = spec.bounds.right
-                    bounds[offset + 3] = spec.bounds.bottom
-
-                    intensities[i] = spec.intensity
-                }
-            }
-
-            glProgram.setFloatsUniform("uShapes", shapes)
-            glProgram.setFloatsUniform("uTypes", types)
-            glProgram.setFloatsUniform("uBounds", bounds)
-            glProgram.setFloatsUniform("uIntensities", intensities)
+            // Bind Slot 0
+            bindSlot(0, activeSpecs.getOrNull(0))
+            // Bind Slot 1
+            bindSlot(1, activeSpecs.getOrNull(1))
+            // Bind Slot 2
+            bindSlot(2, activeSpecs.getOrNull(2))
+            // Bind Slot 3
+            bindSlot(3, activeSpecs.getOrNull(3))
 
             // Set frame buffer / texture parameters
             glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
@@ -245,6 +233,50 @@ private class BlurGlShaderProgram(
             GlUtil.checkGlError()
         } catch (e: Exception) {
             throw VideoFrameProcessingException("OpenGL error during BlurGlShaderProgram drawFrame", e)
+        }
+    }
+
+    private fun bindSlot(slotIndex: Int, spec: BlurSpec?) {
+        val activeKey = "uActive$slotIndex"
+        val shapeKey = "uShape$slotIndex"
+        val typeKey = "uType$slotIndex"
+        val boundsKey = "uBounds$slotIndex"
+        val intensityKey = "uIntensity$slotIndex"
+
+        if (spec != null) {
+            glProgram.setIntUniform(activeKey, 1)
+            glProgram.setIntUniform(
+                shapeKey,
+                when (spec.shape) {
+                    BlurShape.RECTANGLE -> 0
+                    BlurShape.CIRCLE -> 1
+                    BlurShape.FULL_FRAME -> 2
+                }
+            )
+            glProgram.setIntUniform(
+                typeKey,
+                when (spec.type) {
+                    BlurType.GAUSSIAN -> 0
+                    BlurType.MOSAIC -> 1
+                    BlurType.PRIVACY_BOX -> 2
+                }
+            )
+            glProgram.setFloatsUniform(
+                boundsKey,
+                floatArrayOf(
+                    spec.bounds.left,
+                    spec.bounds.top,
+                    spec.bounds.right,
+                    spec.bounds.bottom
+                )
+            )
+            glProgram.setFloatUniform(intensityKey, spec.intensity)
+        } else {
+            glProgram.setIntUniform(activeKey, 0)
+            glProgram.setIntUniform(shapeKey, 0)
+            glProgram.setIntUniform(typeKey, 0)
+            glProgram.setFloatsUniform(boundsKey, floatArrayOf(0f, 0f, 0f, 0f))
+            glProgram.setFloatUniform(intensityKey, 0f)
         }
     }
 
