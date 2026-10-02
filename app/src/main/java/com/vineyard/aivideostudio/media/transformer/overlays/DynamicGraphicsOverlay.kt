@@ -294,41 +294,44 @@ class DynamicGraphicsOverlay(
         canvasHeight: Float
     ) {
         val pulse = (sin(currentTimeMs * 0.012) * 0.5 + 0.5).toFloat()
-        val bounceOffset = pulse * 10f * scaleFactor
+        val bounceOffset = pulse * 8f * scaleFactor
 
         fillPaint.color = color
-        fillPaint.alpha = (210 + (pulse * 45)).toInt().coerceIn(0, 255)
+        fillPaint.alpha = (215 + (pulse * 40)).toInt().coerceIn(0, 255)
 
         val arrowWidth = 32f * scaleFactor
-        val arrowLength = 40f * scaleFactor
+        val arrowLength = 38f * scaleFactor
         arrowPath.reset()
 
         when (direction) {
             ArrowDirection.DOWN -> {
-                // Pin arrow tip accurately to the top boundary of the targeted object
-                val tipX = targetRect.centerX().coerceIn(arrowWidth, canvasWidth - arrowWidth)
-                val tipY = (targetRect.top - (4f * scaleFactor) + bounceOffset).coerceIn(arrowLength + 4f, canvasHeight - 4f)
+                // Pin arrow tip squarely onto the physical upper perimeter of the target
+                val tipX = targetRect.centerX().coerceIn(arrowWidth / 2f + 4f, canvasWidth - arrowWidth / 2f - 4f)
+                val tipY = (targetRect.top + (bounceOffset * 0.4f)).coerceIn(arrowLength + 4f, canvasHeight - 4f)
                 arrowPath.moveTo(tipX, tipY)
                 arrowPath.lineTo(tipX - (arrowWidth / 2f), tipY - arrowLength)
                 arrowPath.lineTo(tipX + (arrowWidth / 2f), tipY - arrowLength)
             }
             ArrowDirection.UP -> {
-                val tipX = targetRect.centerX().coerceIn(arrowWidth, canvasWidth - arrowWidth)
-                val tipY = (targetRect.bottom + (4f * scaleFactor) - bounceOffset).coerceIn(4f, canvasHeight - arrowLength - 4f)
+                // Pin arrow tip squarely onto the physical bottom perimeter of the target
+                val tipX = targetRect.centerX().coerceIn(arrowWidth / 2f + 4f, canvasWidth - arrowWidth / 2f - 4f)
+                val tipY = (targetRect.bottom - (bounceOffset * 0.4f)).coerceIn(4f, canvasHeight - arrowLength - 4f)
                 arrowPath.moveTo(tipX, tipY)
                 arrowPath.lineTo(tipX - (arrowWidth / 2f), tipY + arrowLength)
                 arrowPath.lineTo(tipX + (arrowWidth / 2f), tipY + arrowLength)
             }
             ArrowDirection.RIGHT -> {
-                val tipX = (targetRect.left - (4f * scaleFactor) + bounceOffset).coerceIn(arrowLength + 4f, canvasWidth - 4f)
-                val tipY = targetRect.centerY().coerceIn(arrowWidth, canvasHeight - arrowWidth)
+                // Pin arrow tip squarely onto the physical left edge of the target
+                val tipX = (targetRect.left + (bounceOffset * 0.4f)).coerceIn(arrowLength + 4f, canvasWidth - 4f)
+                val tipY = targetRect.centerY().coerceIn(arrowWidth / 2f + 4f, canvasHeight - arrowWidth / 2f - 4f)
                 arrowPath.moveTo(tipX, tipY)
                 arrowPath.lineTo(tipX - arrowLength, tipY - (arrowWidth / 2f))
                 arrowPath.lineTo(tipX - arrowLength, tipY + (arrowWidth / 2f))
             }
             ArrowDirection.LEFT -> {
-                val tipX = (targetRect.right + (4f * scaleFactor) - bounceOffset).coerceIn(4f, canvasWidth - arrowLength - 4f)
-                val tipY = targetRect.centerY().coerceIn(arrowWidth, canvasHeight - arrowWidth)
+                // Pin arrow tip squarely onto the physical right edge of the target
+                val tipX = (targetRect.right - (bounceOffset * 0.4f)).coerceIn(4f, canvasWidth - arrowLength - 4f)
+                val tipY = targetRect.centerY().coerceIn(arrowWidth / 2f + 4f, canvasHeight - arrowWidth / 2f - 4f)
                 arrowPath.moveTo(tipX, tipY)
                 arrowPath.lineTo(tipX + arrowLength, tipY - (arrowWidth / 2f))
                 arrowPath.lineTo(tipX + arrowLength, tipY + (arrowWidth / 2f))
@@ -337,7 +340,7 @@ class DynamicGraphicsOverlay(
 
         arrowPath.close()
 
-        // Crisp dark outline so arrow remains sharp against any background
+        // Crisp dark outline so arrow remains razor-sharp on any background
         strokePaint.color = Color.BLACK
         strokePaint.strokeWidth = 3.5f * scaleFactor
         strokePaint.alpha = 200
@@ -356,7 +359,7 @@ class DynamicGraphicsOverlay(
 
         // Top-Right
         canvas.drawLine(r.right, r.top, r.right - len, r.top, paint)
-        canvas.drawLine(r.right, r.top, r.right, r.top + len, paint)
+        canvas.drawLine(r.right, r.top, r.right - len, r.top, paint)
 
         // Bottom-Left
         canvas.drawLine(r.left, r.bottom, r.left + len, r.bottom, paint)
