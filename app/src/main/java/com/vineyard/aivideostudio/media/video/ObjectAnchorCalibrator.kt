@@ -2,6 +2,7 @@ package com.vineyard.aivideostudio.media.video
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Rect
 import android.media.MediaMetadataRetriever
 import com.google.android.gms.tasks.Tasks
@@ -21,6 +22,7 @@ import com.vineyard.aivideostudio.processing.logger.ProcessingLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -28,7 +30,7 @@ import kotlin.math.min
  * On-device calibrator for physical objects and human faces in Script Mode.
  *
  * Implements dynamic timeline column tracking for moving heads and
- * strict stationary margin constraints for physical objects.
+ * adaptive visual saliency edge calibration for physical objects.
  */
 class ObjectAnchorCalibrator(
     private val context: Context,
@@ -227,7 +229,7 @@ class ObjectAnchorCalibrator(
         return try {
             val detected = when (spec.targetType?.lowercase()) {
                 "face" -> detectClosestFace(frameBitmap, spec.bounds)
-                "object" -> detectClosestObject(frameBitmap, spec.bounds, spec.objectClass)
+                "object" -> detectClosestObject(frameBitmap, spec.bounds, spec.objectClass) ?: refineObjectBoundsBySaliency(frameBitmap, spec.bounds)
                 else -> null
             }
             if (detected != null) {
@@ -259,7 +261,7 @@ class ObjectAnchorCalibrator(
 
                     val detectedBounds = when (indicator.targetType?.lowercase()) {
                         "face" -> detectClosestFace(frameBitmap, initialBounds)
-                        "object" -> detectClosestObject(frameBitmap, initialBounds, indicator.objectClass)
+                        "object" -> detectClosestObject(frameBitmap, initialBounds, indicator.objectClass) ?: refineObjectBoundsBySaliency(frameBitmap, initialBounds)
                         else -> null
                     }
 
@@ -292,23 +294,40 @@ class ObjectAnchorCalibrator(
             try {
                 val detectedBounds = when (indicator.targetType?.lowercase()) {
                     "face" -> detectClosestFace(frameBitmap, initialBounds)
-                    "object" -> detectClosestObject(frameBitmap, initialBounds, indicator.objectClass)
+                    "object" -> {
+                        val mlKitResult = detectClosestObject(frameBitmap, initialBounds, indicator.objectClass)
+                        if (mlKitResult != null) {
+                            mlKitResult
+                        } else {
+                            logger.log(
+                                "CALIBRATION",
+                                PipelineStatus.EXPORTING,
+                                "🔍 [MLKIT-DIAGNOSTIC] ML Kit returned 0 standard classes for '${indicator.label ?: indicator.id}'. Initiating visual saliency contrast calibration...",
+                                LogSeverity.INFO
+                            )
+                            refineObjectBoundsBySaliency(frameBitmap, initialBounds)
+                        }
+                    }
                     else -> null
                 }
 
                 if (detectedBounds != null) {
+                    val cX = (detectedBounds.left + detectedBounds.right) / 2f
+                    val cY = (detectedBounds.top + detectedBounds.bottom) / 2f
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) tightened to physical edges at ${indicator.startTimeMs}ms",
+                        "🎯 [SNAP-AUTOFIX] Indicator '${indicator.id}' (${indicator.label}) calibrated to physical surface: Center=(X:${"%.3f".format(cX)}, Y:${"%.3f".format(cY)}) | Box=[L:${"%.3f".format(detectedBounds.left)}, T:${"%.3f".format(detectedBounds.top)}, R:${"%.3f".format(detectedBounds.right)}, B:${"%.3f".format(detectedBounds.bottom)}]",
                         LogSeverity.SUCCESS
                     )
                     indicator.copy(staticBounds = detectedBounds)
                 } else {
+                    val initCX = (initialBounds.left + initialBounds.right) / 2f
+                    val initCY = (initialBounds.top + initialBounds.bottom) / 2f
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "🔒 [ANCHOR-LOCK] Indicator '${indicator.id}' (${indicator.label}) locked firmly to Gemini Vision anchor (furniture distraction rejected).",
+                        "🔒 [ANCHOR-LOCK] Indicator '${indicator.id}' (${indicator.label}) locked to Gemini Vision anchor: Center=(X:${"%.3f".format(initCX)}, Y:${"%.3f".format(initCY)})",
                         LogSeverity.INFO
                     )
                     indicator
@@ -439,6 +458,77 @@ class ObjectAnchorCalibrator(
             bestObjectBounds
         } catch (e: Exception) {
             logger.log("CALIBRATION", PipelineStatus.EXPORTING, "ML Kit Object detection error: ${e.message}", LogSeverity.ERROR)
+            null
+        }
+    }
+
+    /**
+     * Local visual saliency refinement: Scans pixel gradients within the Gemini Vision ROI
+     * to snap tightly onto non-standard deformable objects (e.g. blanket, cloth, pillow)
+     * without snapping onto empty wall or bedsheet background.
+     */
+    private fun refineObjectBoundsBySaliency(
+        bitmap: Bitmap,
+        anchorBounds: NormalizedBounds
+    ): NormalizedBounds? {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val roiLeft = (anchorBounds.left * width).toInt().coerceIn(0, width - 1)
+        val roiTop = (anchorBounds.top * height).toInt().coerceIn(0, height - 1)
+        val roiRight = (anchorBounds.right * width).toInt().coerceIn(roiLeft + 1, width)
+        val roiBottom = (anchorBounds.bottom * height).toInt().coerceIn(roiTop + 1, height)
+
+        if (roiRight - roiLeft < 10 || roiBottom - roiTop < 10) return null
+
+        var minX = roiRight
+        var maxX = roiLeft
+        var minY = roiBottom
+        var maxY = roiTop
+        var salientPixelsFound = 0
+
+        // Compute baseline background luminance from border pixels
+        var borderLumaSum = 0.0
+        var borderCount = 0
+        val step = max(1, (roiRight - roiLeft) / 20)
+
+        for (x in roiLeft until roiRight step step) {
+            val pTop = bitmap.getPixel(x, roiTop)
+            val pBottom = bitmap.getPixel(x, roiBottom - 1)
+            borderLumaSum += (Color.red(pTop) * 0.299 + Color.green(pTop) * 0.587 + Color.blue(pTop) * 0.114)
+            borderLumaSum += (Color.red(pBottom) * 0.299 + Color.green(pBottom) * 0.587 + Color.blue(pBottom) * 0.114)
+            borderCount += 2
+        }
+        val bgLuma = if (borderCount > 0) borderLumaSum / borderCount else 128.0
+
+        // Detect salient foreground object pixels with distinct contrast from background
+        val sampleStep = max(2, (roiRight - roiLeft) / 30)
+        for (y in roiTop until roiBottom step sampleStep) {
+            for (x in roiLeft until roiRight step sampleStep) {
+                val pixel = bitmap.getPixel(x, y)
+                val luma = Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114
+                val contrastDiff = abs(luma - bgLuma)
+
+                if (contrastDiff > 18.0) { // Salient object feature threshold
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                    minY = min(minY, y)
+                    maxY = max(maxY, y)
+                    salientPixelsFound++
+                }
+            }
+        }
+
+        return if (salientPixelsFound >= 12 && maxX > minX && maxY > minY) {
+            val padW = ((maxX - minX) * 0.05f).toInt()
+            val padH = ((maxY - minY) * 0.05f).toInt()
+            NormalizedBounds(
+                left = ((minX - padW).coerceAtLeast(0) / width.toFloat()).coerceIn(0f, 1f),
+                top = ((minY - padH).coerceAtLeast(0) / height.toFloat()).coerceIn(0f, 1f),
+                right = ((maxX + padW).coerceAtMost(width) / width.toFloat()).coerceIn(0f, 1f),
+                bottom = ((maxY + padH).coerceAtMost(height) / height.toFloat()).coerceIn(0f, 1f)
+            )
+        } else {
             null
         }
     }
