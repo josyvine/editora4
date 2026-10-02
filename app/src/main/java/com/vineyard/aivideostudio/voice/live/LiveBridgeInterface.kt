@@ -13,6 +13,7 @@ interface LiveCommentaryListener {
     fun onCommentaryFinished()
     fun onError(errorMessage: String)
     fun onDiagnostic(message: String, category: String)
+    fun onTargetCoordinatesReceived(targetId: String, left: Float, top: Float, right: Float, bottom: Float) {}
 }
 
 /**
@@ -77,5 +78,16 @@ class LiveBridgeInterface(
     @JavascriptInterface
     fun logDiagnostic(message: String, category: String) {
         listener.onDiagnostic(message, category)
+    }
+
+    @JavascriptInterface
+    fun onTargetCoordinatesReceived(targetId: String, left: Double, top: Double, right: Double, bottom: Double) {
+        listener.onTargetCoordinatesReceived(
+            targetId = targetId,
+            left = left.toFloat(),
+            top = top.toFloat(),
+            right = right.toFloat(),
+            bottom = bottom.toFloat()
+        )
     }
 }
