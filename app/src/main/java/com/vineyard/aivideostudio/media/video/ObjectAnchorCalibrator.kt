@@ -36,9 +36,10 @@ class ObjectAnchorCalibrator(
 ) {
 
     companion object {
-        private const val FACE_SNAP_THRESHOLD = 0.25f // Max distance allowed for face contour snap
-        private const val OBJECT_MAX_DRIFT_THRESHOLD = 0.12f // Strict max drift to prevent jumping onto background furniture
-        private const val OBJECT_MIN_IOU_THRESHOLD = 0.15f // Minimum overlap required to accept an ML Kit object snap
+        private const val FACE_SNAP_THRESHOLD = 0.32f // Expanded threshold to capture steep head tilts & yaw
+        private const val OBJECT_MAX_DRIFT_THRESHOLD = 0.18f // Max allowed drift for physical objects
+        private const val OBJECT_MIN_IOU_THRESHOLD = 0.08f // Minimum overlap required to accept an ML Kit object snap
+        private const val DYNAMIC_SLICE_STEP_MS = 1000L // 1.0-second high-frequency tracking slices
     }
 
     // High accuracy face detector for precise contour bounding
@@ -157,24 +158,24 @@ class ObjectAnchorCalibrator(
         val durationMs = spec.endTimeMs - spec.startTimeMs
         val isFaceTarget = spec.targetType.equals("face", ignoreCase = true)
 
-        if (!isFaceTarget || durationMs <= 4000L) {
+        if (!isFaceTarget || durationMs <= 1500L) {
             val single = calibrateSingleBlurFrame(retriever, spec, spec.startTimeMs)
             return listOf(single)
         }
 
-        val sliceStepMs = 5000L // 5-second dynamic tracking slices
+        val sliceStepMs = DYNAMIC_SLICE_STEP_MS
         val slices = mutableListOf<BlurSpec>()
         var cursorStartMs = spec.startTimeMs
 
-        // Establish the target's Motion Column (X-margin) from initial detection
+        // Establish the target's distinct Motion Column (X-margin) from initial detection
         val initialFrame = extractFrame(retriever, spec.startTimeMs * 1000L)
         val initialFace = if (initialFrame != null) {
             try { detectClosestFace(initialFrame, spec.bounds) } finally { initialFrame.recycle() }
         } else null
 
         var lastKnownBounds = initialFace ?: spec.bounds
-        val motionColumnMinX = (lastKnownBounds.left - 0.08f).coerceIn(0.0f, 1.0f)
-        val motionColumnMaxX = (lastKnownBounds.right + 0.08f).coerceIn(0.0f, 1.0f)
+        val motionColumnMinX = (lastKnownBounds.left - 0.12f).coerceIn(0.0f, 1.0f)
+        val motionColumnMaxX = (lastKnownBounds.right + 0.12f).coerceIn(0.0f, 1.0f)
 
         while (cursorStartMs < spec.endTimeMs) {
             val cursorEndMs = minOf(cursorStartMs + sliceStepMs, spec.endTimeMs)
@@ -371,7 +372,7 @@ class ObjectAnchorCalibrator(
 
             for (face in faces) {
                 val normBounds = face.boundingBox.toNormalizedBounds(width, height)
-                // Ensure face is strictly within the subject's assigned motion column
+                // Ensure face center is within the subject's assigned motion column
                 if (normBounds.centerX < minX || normBounds.centerX > maxX) {
                     continue
                 }
@@ -389,8 +390,8 @@ class ObjectAnchorCalibrator(
     }
 
     /**
-     * Inspects on-device objects using strict IoU overlap gating against Gemini Vision's anchor.
-     * Prevents ML Kit from snapping onto nearby furniture, shelves, or walls.
+     * Inspects on-device objects using adaptive IoU overlap gating against Gemini Vision's anchor.
+     * Prevents ML Kit from snapping onto background furniture while supporting generic objects.
      */
     private fun detectClosestObject(
         bitmap: Bitmap,
