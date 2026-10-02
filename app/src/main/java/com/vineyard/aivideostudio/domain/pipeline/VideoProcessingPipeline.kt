@@ -14,7 +14,6 @@ import com.vineyard.aivideostudio.ai.model.CropDecision
 import com.vineyard.aivideostudio.ai.model.HighlightSegment
 import com.vineyard.aivideostudio.ai.model.MasterRecipe
 import com.vineyard.aivideostudio.ai.model.ModelPurpose
-import com.vineyard.aivideostudio.ai.model.NormalizedBoundsDto
 import com.vineyard.aivideostudio.ai.model.SourceAnalysis
 import com.vineyard.aivideostudio.ai.model.TrimDecision
 import com.vineyard.aivideostudio.ai.model.TrimSegment
@@ -68,7 +67,6 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
 
@@ -827,16 +825,14 @@ class VideoProcessingPipeline(
             if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
         }.getOrNull() ?: File(currentVideoUri)
 
-        // Ground blur targets through Gemini Vision if coordinates need directional validation
+        // Ground blur targets through Gemini Live WebSocket if coordinates need directional validation
         val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
-            projectId = projectId,
             videoFile = videoFileForCalibration,
             blurSpecs = remappedBlurSpecs
         )
 
-        // Ground tracking indicators through Gemini Vision if coordinates need directional validation
+        // Ground tracking indicators through Gemini Live WebSocket if coordinates need directional validation
         val visionGroundedTrackingIndicators = groundTrackingTargetsWithVision(
-            projectId = projectId,
             videoFile = videoFileForCalibration,
             indicators = calibratedTrackingIndicators
         )
@@ -945,18 +941,16 @@ class VideoProcessingPipeline(
     }
 
     /**
-     * Uses your selected Live/Vision model to verify and ground physical object & face coordinates
-     * before passing to local ML Kit. Corrects misplaced script coordinates.
+     * Uses Gemini Live Bidi WebSocket stream (100% Live Streaming, Zero REST calls)
+     * to visually ground target coordinates and lead on-device ML Kit.
      */
     private suspend fun groundTrackingTargetsWithVision(
-        projectId: String,
         videoFile: File,
         indicators: List<TrackingIndicatorSpec>
     ): List<TrackingIndicatorSpec> {
         val targetsToGround = indicators.filter { it.targetType.equals("object", ignoreCase = true) || it.targetType.equals("face", ignoreCase = true) }
         if (targetsToGround.isEmpty() || !videoFile.exists()) return indicators
 
-        val selectedVisionModel = modelRepository.getSelectedModelForPurpose(ModelPurpose.LIVE_VOICE)
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(videoFile.absolutePath)
@@ -968,34 +962,24 @@ class VideoProcessingPipeline(
                 val frameBitmap = retriever.getFrameAtTime(indicator.startTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: return@map indicator
 
-                val frameFile = storageManager.createStageOutputFile(projectId, PipelineStatus.TRIM_ANALYSIS)
-                val fos = FileOutputStream(frameFile)
-                frameBitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
-                fos.flush()
-                fos.close()
-                frameBitmap.recycle()
-
                 val targetDesc = indicator.label ?: indicator.objectClass ?: indicator.targetType ?: "target object"
-                val prompt = "Look at this image. Locate the '$targetDesc'. Return ONLY a JSON object with the exact normalized coordinates: {\"left\": float, \"top\": float, \"right\": float, \"bottom\": float} between 0.0 and 1.0."
 
-                val visionResult = geminiClient.generateStructured(
-                    projectId = projectId,
-                    stage = PipelineStatus.EXPORTING,
-                    modelId = selectedVisionModel,
-                    prompt = prompt,
-                    mediaUri = frameFile.absolutePath,
-                    mediaMimeType = "image/jpeg"
-                ) { json -> JsonUtils.fromJson<NormalizedBoundsDto>(json) }
-
-                frameFile.delete()
+                val visionResult = try {
+                    liveCommentatorManager.groundTargetWithLiveVision(
+                        frameBitmap = frameBitmap,
+                        targetId = indicator.id,
+                        targetDescription = targetDesc
+                    )
+                } finally {
+                    frameBitmap.recycle()
+                }
 
                 if (visionResult is AppResult.Success) {
-                    val boundsDto = visionResult.data
-                    val visionBounds = boundsDto.toNormalizedBounds()
+                    val visionBounds = visionResult.data
                     logger.log(
-                        projectId,
+                        "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [VISION-GROUNDING] Target '${indicator.id}' ($targetDesc) grounded by $selectedVisionModel: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
+                        "👁️ [LIVE-WS-VISION] Target '${indicator.id}' ($targetDesc) grounded via Live WebSocket: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
                         LogSeverity.INFO
                     )
                     indicator.copy(staticBounds = visionBounds)
@@ -1004,7 +988,7 @@ class VideoProcessingPipeline(
                 }
             }
         } catch (e: Exception) {
-            logger.log(projectId, PipelineStatus.EXPORTING, "Vision grounding skipped: ${e.message}", LogSeverity.INFO)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Live WebSocket vision grounding skipped: ${e.message}", LogSeverity.INFO)
             indicators
         } finally {
             try { retriever.release() } catch (_: Exception) {}
@@ -1012,51 +996,42 @@ class VideoProcessingPipeline(
     }
 
     private suspend fun groundBlurTargetsWithVision(
-        projectId: String,
         videoFile: File,
         blurSpecs: List<BlurSpec>
     ): List<BlurSpec> {
         val targetsToGround = blurSpecs.filter { it.targetType.equals("face", ignoreCase = true) || it.targetType.equals("object", ignoreCase = true) }
         if (targetsToGround.isEmpty() || !videoFile.exists()) return blurSpecs
 
-        val selectedVisionModel = modelRepository.getSelectedModelForPurpose(ModelPurpose.LIVE_VOICE)
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(videoFile.absolutePath)
-            blurSpecs.map { spec ->
+            blurSpecs.mapIndexed { idx, spec ->
                 if (!spec.targetType.equals("face", ignoreCase = true) && !spec.targetType.equals("object", ignoreCase = true)) {
-                    return@map spec
+                    return@mapIndexed spec
                 }
 
                 val frameBitmap = retriever.getFrameAtTime(spec.startTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    ?: return@map spec
+                    ?: return@mapIndexed spec
 
-                val frameFile = storageManager.createStageOutputFile(projectId, PipelineStatus.TRIM_ANALYSIS)
-                val fos = FileOutputStream(frameFile)
-                frameBitmap.compress(Bitmap.CompressFormat.JPEG, 85, fos)
-                fos.flush()
-                fos.close()
-                frameBitmap.recycle()
+                val targetId = "blur_${spec.targetType}_$idx"
+                val targetDesc = spec.targetType ?: "face"
 
-                val prompt = "Look at this image. Locate the '${spec.targetType}'. Return ONLY a JSON object with the exact normalized coordinates: {\"left\": float, \"top\": float, \"right\": float, \"bottom\": float} between 0.0 and 1.0."
-
-                val visionResult = geminiClient.generateStructured(
-                    projectId = projectId,
-                    stage = PipelineStatus.EXPORTING,
-                    modelId = selectedVisionModel,
-                    prompt = prompt,
-                    mediaUri = frameFile.absolutePath,
-                    mediaMimeType = "image/jpeg"
-                ) { json -> JsonUtils.fromJson<NormalizedBoundsDto>(json) }
-
-                frameFile.delete()
+                val visionResult = try {
+                    liveCommentatorManager.groundTargetWithLiveVision(
+                        frameBitmap = frameBitmap,
+                        targetId = targetId,
+                        targetDescription = targetDesc
+                    )
+                } finally {
+                    frameBitmap.recycle()
+                }
 
                 if (visionResult is AppResult.Success) {
-                    val visionBounds = visionResult.data.toNormalizedBounds()
+                    val visionBounds = visionResult.data
                     logger.log(
-                        projectId,
+                        "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [VISION-GROUNDING] Blur target '${spec.targetType}' grounded by $selectedVisionModel: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
+                        "👁️ [LIVE-WS-VISION] Blur target '${spec.targetType}' grounded via Live WebSocket: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
                         LogSeverity.INFO
                     )
                     spec.copy(bounds = visionBounds)
@@ -1065,7 +1040,7 @@ class VideoProcessingPipeline(
                 }
             }
         } catch (e: Exception) {
-            logger.log(projectId, PipelineStatus.EXPORTING, "Vision blur grounding skipped: ${e.message}", LogSeverity.INFO)
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Live WebSocket blur grounding skipped: ${e.message}", LogSeverity.INFO)
             blurSpecs
         } finally {
             try { retriever.release() } catch (_: Exception) {}
