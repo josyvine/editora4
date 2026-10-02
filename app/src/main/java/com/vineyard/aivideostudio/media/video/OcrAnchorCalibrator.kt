@@ -66,15 +66,24 @@ object OcrAnchorCalibrator {
 
         try {
             for (indicator in indicators) {
-                val searchTarget = indicator.targetText?.trim()
-                val hasSearchTarget = !searchTarget.isNullOrBlank()
+                // Strict Guard: Never process physical objects or faces with OCR
+                val isExplicitObjectOrFace = indicator.targetType.equals("object", ignoreCase = true) ||
+                        indicator.targetType.equals("face", ignoreCase = true)
 
-                val anchorQuery = if (hasSearchTarget) {
-                    searchTarget
-                } else if (!indicator.label.isNullOrBlank() && indicator.label.length > 2) {
-                    indicator.label.trim()
-                } else {
-                    null
+                if (isExplicitObjectOrFace) {
+                    calibratedIndicators.add(indicator)
+                    continue
+                }
+
+                val searchTarget = indicator.targetText?.trim()
+                val isExplicitTextTarget = indicator.targetType.equals("ocr_text", ignoreCase = true) ||
+                        indicator.targetType.equals("text", ignoreCase = true)
+
+                // Only form an anchorQuery if explicitly marked as text or targetText is provided
+                val anchorQuery = when {
+                    !searchTarget.isNullOrBlank() -> searchTarget
+                    isExplicitTextTarget && !indicator.label.isNullOrBlank() && indicator.label.length > 2 -> indicator.label.trim()
+                    else -> null
                 }
 
                 if (anchorQuery == null) {
