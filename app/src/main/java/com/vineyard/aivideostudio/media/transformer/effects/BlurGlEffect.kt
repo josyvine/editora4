@@ -18,6 +18,7 @@ import com.vineyard.aivideostudio.core.model.effects.BlurType
 /**
  * Custom Media3 OpenGL shader effect that applies selective Gaussian,
  * Mosaic, or Privacy Box blur to specified normalized coordinates and time windows.
+ * Supports simultaneous multi-target rendering in a single GPU pass.
  */
 @OptIn(UnstableApi::class)
 class BlurGlEffect(
@@ -41,6 +42,8 @@ private class BlurGlShaderProgram(
     private var currentHeight: Int = 1920
 
     companion object {
+        private const val MAX_CONCURRENT_BLURS = 8
+
         private const val VERTEX_SHADER = """
             attribute vec4 aFramePosition;
             varying vec2 vTexSamplingCoords;
@@ -56,77 +59,105 @@ private class BlurGlShaderProgram(
             varying vec2 vTexSamplingCoords;
 
             uniform vec2 uTexSize;
-            uniform int uActive;
-            uniform int uShape;      // 0: RECTANGLE, 1: CIRCLE, 2: FULL_FRAME
-            uniform int uType;       // 0: GAUSSIAN, 1: MOSAIC, 2: PRIVACY_BOX
-            uniform vec4 uBounds;    // x: left, y: top, z: right, w: bottom
-            uniform float uIntensity;
+            uniform int uActiveCount;
+            uniform int uShapes[$MAX_CONCURRENT_BLURS];      // 0: RECTANGLE, 1: CIRCLE, 2: FULL_FRAME
+            uniform int uTypes[$MAX_CONCURRENT_BLURS];       // 0: GAUSSIAN, 1: MOSAIC, 2: PRIVACY_BOX
+            uniform vec4 uBounds[$MAX_CONCURRENT_BLURS];     // x: left, y: top, z: right, w: bottom
+            uniform float uIntensities[$MAX_CONCURRENT_BLURS];
 
-            bool isInsideRegion(vec2 uv) {
-                // Media3 OpenGL coordinate: Y is inverted (0.0 top, 1.0 bottom)
+            bool isInsideRegion(vec2 uv, int idx) {
                 float normY = 1.0 - uv.y;
                 float normX = uv.x;
+                int shape = uShapes[idx];
+                vec4 b = uBounds[idx];
 
-                if (uShape == 2) { // FULL_FRAME
+                if (shape == 2) { // FULL_FRAME
                     return true;
                 }
                 
-                if (uShape == 0) { // RECTANGLE
-                    return normX >= uBounds.x && normX <= uBounds.z &&
-                           normY >= uBounds.y && normY <= uBounds.w;
+                if (shape == 0) { // RECTANGLE
+                    return normX >= b.x && normX <= b.z &&
+                           normY >= b.y && normY <= b.w;
                 }
 
-                if (uShape == 1) { // CIRCLE
-                    vec2 center = vec2((uBounds.x + uBounds.z) * 0.5, (uBounds.y + uBounds.w) * 0.5);
-                    float radiusX = (uBounds.z - uBounds.x) * 0.5;
-                    float radiusY = (uBounds.w - uBounds.y) * 0.5;
+                if (shape == 1) { // CIRCLE / ELLIPSE
+                    vec2 center = vec2((b.x + b.z) * 0.5, (b.y + b.w) * 0.5);
+                    float radiusX = (b.z - b.x) * 0.5;
+                    float radiusY = (b.w - b.y) * 0.5;
                     float normalizedDist = pow((normX - center.x) / max(radiusX, 0.001), 2.0) +
-                                         pow((normY - center.y) / max(radiusY, 0.001), 2.0);
+                                           pow((normY - center.y) / max(radiusY, 0.001), 2.0);
                     return normalizedDist <= 1.0;
                 }
 
                 return false;
             }
 
-            vec4 applyMosaic(vec2 uv) {
-                float pixelBlock = max(uIntensity * 2.0, 8.0);
+            vec4 applyMosaic(vec2 uv, float intensity) {
+                float pixelBlock = max(intensity * 3.0, 12.0);
                 vec2 stepCoord = pixelBlock / uTexSize;
                 vec2 coord = floor(uv / stepCoord) * stepCoord + (stepCoord * 0.5);
                 return texture2D(uTexSampler, coord);
             }
 
-            vec4 applyGaussian(vec2 uv) {
-                float radius = max(uIntensity, 1.0);
+            vec4 applyDenseGaussian(vec2 uv, float intensity) {
+                float radius = max(intensity * 2.2, 3.5);
                 vec2 texOffset = vec2(radius / uTexSize.x, radius / uTexSize.y);
                 
                 vec4 sum = vec4(0.0);
-                // 9-Tap Separable Gaussian Kernel Approximation
-                sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, -texOffset.y)) * 0.0625;
-                sum += texture2D(uTexSampler, uv + vec2(0.0, -texOffset.y)) * 0.125;
-                sum += texture2D(uTexSampler, uv + vec2(texOffset.x, -texOffset.y)) * 0.0625;
+                // 17-Tap Multi-Ring Heavy Privacy Obfuscation Convolution
+                sum += texture2D(uTexSampler, uv) * 0.18;
 
-                sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, 0.0)) * 0.125;
-                sum += texture2D(uTexSampler, uv) * 0.25;
-                sum += texture2D(uTexSampler, uv + vec2(texOffset.x, 0.0)) * 0.125;
+                sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, 0.0)) * 0.11;
+                sum += texture2D(uTexSampler, uv + vec2(texOffset.x, 0.0)) * 0.11;
+                sum += texture2D(uTexSampler, uv + vec2(0.0, -texOffset.y)) * 0.11;
+                sum += texture2D(uTexSampler, uv + vec2(0.0, texOffset.y)) * 0.11;
 
-                sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, texOffset.y)) * 0.0625;
-                sum += texture2D(uTexSampler, uv + vec2(0.0, texOffset.y)) * 0.125;
-                sum += texture2D(uTexSampler, uv + vec2(texOffset.x, texOffset.y)) * 0.0625;
+                sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, -texOffset.y)) * 0.07;
+                sum += texture2D(uTexSampler, uv + vec2(texOffset.x, -texOffset.y)) * 0.07;
+                sum += texture2D(uTexSampler, uv + vec2(-texOffset.x, texOffset.y)) * 0.07;
+                sum += texture2D(uTexSampler, uv + vec2(texOffset.x, texOffset.y)) * 0.07;
+
+                // Outer sampling ring for complete facial feature concealment
+                vec2 outerOffset = texOffset * 1.8;
+                sum += texture2D(uTexSampler, uv + vec2(-outerOffset.x, 0.0)) * 0.035;
+                sum += texture2D(uTexSampler, uv + vec2(outerOffset.x, 0.0)) * 0.035;
+                sum += texture2D(uTexSampler, uv + vec2(0.0, -outerOffset.y)) * 0.035;
+                sum += texture2D(uTexSampler, uv + vec2(0.0, outerOffset.y)) * 0.035;
+
+                sum += texture2D(uTexSampler, uv + vec2(-outerOffset.x, -outerOffset.y)) * 0.0175;
+                sum += texture2D(uTexSampler, uv + vec2(outerOffset.x, -outerOffset.y)) * 0.0175;
+                sum += texture2D(uTexSampler, uv + vec2(-outerOffset.x, outerOffset.y)) * 0.0175;
+                sum += texture2D(uTexSampler, uv + vec2(outerOffset.x, outerOffset.y)) * 0.0175;
 
                 return sum;
             }
 
             void main() {
-                if (uActive == 0 || !isInsideRegion(vTexSamplingCoords)) {
+                if (uActiveCount <= 0) {
                     gl_FragColor = texture2D(uTexSampler, vTexSamplingCoords);
                     return;
                 }
 
-                if (uType == 1) { // MOSAIC
-                    gl_FragColor = applyMosaic(vTexSamplingCoords);
-                } else { // GAUSSIAN or PRIVACY_BOX
-                    gl_FragColor = applyGaussian(vTexSamplingCoords);
+                // Check active blur regions simultaneously
+                for (int i = 0; i < $MAX_CONCURRENT_BLURS; i++) {
+                    if (i >= uActiveCount) {
+                        break;
+                    }
+
+                    if (isInsideRegion(vTexSamplingCoords, i)) {
+                        int blurType = uTypes[i];
+                        float intensity = uIntensities[i];
+
+                        if (blurType == 1) { // MOSAIC
+                            gl_FragColor = applyMosaic(vTexSamplingCoords, intensity);
+                        } else { // GAUSSIAN or PRIVACY_BOX
+                            gl_FragColor = applyDenseGaussian(vTexSamplingCoords, intensity);
+                        }
+                        return;
+                    }
                 }
+
+                gl_FragColor = texture2D(uTexSampler, vTexSamplingCoords);
             }
         """
     }
@@ -134,7 +165,6 @@ private class BlurGlShaderProgram(
     init {
         try {
             glProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER)
-            // Bind the full-screen quad vertex position buffer to aFramePosition
             glProgram.setBufferAttribute(
                 "aFramePosition",
                 GlUtil.getNormalizedCoordinateBounds(),
@@ -156,42 +186,44 @@ private class BlurGlShaderProgram(
             glProgram.use()
 
             val currentTimeMs = presentationTimeUs / 1000L
-            val activeSpec = blurSpecs.firstOrNull { spec ->
+            val activeSpecs = blurSpecs.filter { spec ->
                 currentTimeMs in spec.startTimeMs..spec.endTimeMs
-            }
+            }.take(MAX_CONCURRENT_BLURS)
 
-            if (activeSpec != null) {
-                glProgram.setIntUniform("uActive", 1)
-                glProgram.setIntUniform(
-                    "uShape",
-                    when (activeSpec.shape) {
+            val activeCount = activeSpecs.size
+            glProgram.setIntUniform("uActiveCount", activeCount)
+
+            if (activeCount > 0) {
+                val shapes = IntArray(MAX_CONCURRENT_BLURS)
+                val types = IntArray(MAX_CONCURRENT_BLURS)
+                val bounds = FloatArray(MAX_CONCURRENT_BLURS * 4)
+                val intensities = FloatArray(MAX_CONCURRENT_BLURS)
+
+                for (i in 0 until activeCount) {
+                    val spec = activeSpecs[i]
+                    shapes[i] = when (spec.shape) {
                         BlurShape.RECTANGLE -> 0
                         BlurShape.CIRCLE -> 1
                         BlurShape.FULL_FRAME -> 2
                     }
-                )
-                glProgram.setIntUniform(
-                    "uType",
-                    when (activeSpec.type) {
+                    types[i] = when (spec.type) {
                         BlurType.GAUSSIAN -> 0
                         BlurType.MOSAIC -> 1
                         BlurType.PRIVACY_BOX -> 2
                     }
-                )
-                glProgram.setFloatsUniform(
-                    "uBounds",
-                    floatArrayOf(
-                        activeSpec.bounds.left,
-                        activeSpec.bounds.top,
-                        activeSpec.bounds.right,
-                        activeSpec.bounds.bottom
-                    )
-                )
-                glProgram.setFloatUniform("uIntensity", activeSpec.intensity)
-            } else {
-                glProgram.setIntUniform("uActive", 0)
-                glProgram.setFloatsUniform("uBounds", floatArrayOf(0f, 0f, 0f, 0f))
-                glProgram.setFloatUniform("uIntensity", 0f)
+                    val offset = i * 4
+                    bounds[offset] = spec.bounds.left
+                    bounds[offset + 1] = spec.bounds.top
+                    bounds[offset + 2] = spec.bounds.right
+                    bounds[offset + 3] = spec.bounds.bottom
+
+                    intensities[i] = spec.intensity
+                }
+
+                glProgram.setIntsUniform("uShapes", shapes)
+                glProgram.setIntsUniform("uTypes", types)
+                glProgram.setFloatsUniform("uBounds", bounds)
+                glProgram.setFloatsUniform("uIntensities", intensities)
             }
 
             // Set frame buffer / texture parameters
