@@ -700,15 +700,13 @@ class VideoProcessingPipeline(
             emptyList()
         }
 
-        val remappedBlurSpecs = TimelineMapper.remapBlurSpecs(timelineMap, blurSpecs)
         val remappedReplacementOverlays = TimelineMapper.remapReplacementOverlays(timelineMap, replacementSpecs)
-        val remappedTrackingIndicators = TimelineMapper.remapTrackingIndicators(timelineMap, trackingSpecs)
         val remappedTextCards = TimelineMapper.remapTextCards(timelineMap, cardSpecs)
 
         logger.log(
             projectId,
             PipelineStatus.CAPTION_ANALYSIS,
-            "Automated Remapping: Translated ${remappedCommentarySegments.size} voice cues, ${remappedCaptions.size} captions, ${remappedBlurSpecs.size} blurs, ${remappedTrackingIndicators.size} highlights, ${remappedReplacementOverlays.size} overlays, and ${remappedTextCards.size} text cards",
+            "Automated Remapping: Translated ${remappedCommentarySegments.size} voice cues, ${remappedCaptions.size} captions, ${blurSpecs.size} blurs, ${trackingSpecs.size} highlights, ${remappedReplacementOverlays.size} overlays, and ${remappedTextCards.size} text cards",
             LogSeverity.INFO
         )
 
@@ -794,12 +792,17 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (Target-Isolated Calibration + Media3 Hardware Shaders)
+        // 7. FINAL PRODUCTION EXPORT (Target-Isolated Calibration on RAW Source Frames + Speed Remapping)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
-        // Auto-Fix 1: OCR Text Calibration (ONLY for explicit OCR typography targets)
-        val (ocrIndicators, nonOcrIndicators) = remappedTrackingIndicators.partition { indicator ->
+        val videoFileForCalibration = runCatching {
+            val uri = Uri.parse(currentVideoUri)
+            if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
+        }.getOrNull() ?: File(currentVideoUri)
+
+        // Auto-Fix 1: OCR Text Calibration on RAW source frames using original recipe timestamps
+        val (ocrIndicators, nonOcrIndicators) = trackingSpecs.partition { indicator ->
             indicator.targetType.equals("ocr_text", ignoreCase = true) ||
             indicator.targetType.equals("text", ignoreCase = true)
         }
@@ -828,18 +831,13 @@ class VideoProcessingPipeline(
             emptyList()
         }
 
-        // Combine OCR-calibrated targets and non-OCR object targets
+        // Combine OCR-calibrated targets and non-OCR object targets before vision pass
         val combinedIndicators = calibratedOcrIndicators + nonOcrIndicators
-
-        val videoFileForCalibration = runCatching {
-            val uri = Uri.parse(currentVideoUri)
-            if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
-        }.getOrNull() ?: File(currentVideoUri)
 
         // Pass 1: Establish Target-Isolated Dynamic Spatial Columns via Gemini Live WebSocket
         val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
             videoFile = videoFileForCalibration,
-            blurSpecs = remappedBlurSpecs
+            blurSpecs = blurSpecs
         )
 
         val visionGroundedTrackingIndicators = groundTrackingTargetsWithVision(
@@ -874,10 +872,14 @@ class VideoProcessingPipeline(
 
         val fullyCalibratedBlurSpecs = mlKitSnappedBlurSpecs
 
+        // Step 8: Remap Calibrated Targets to the Speed-Compressed Export Timeline
+        val remappedBlurSpecs = TimelineMapper.remapBlurSpecs(timelineMap, fullyCalibratedBlurSpecs)
+        val remappedTrackingIndicators = TimelineMapper.remapTrackingIndicators(timelineMap, fullyCalibratedTrackingIndicators)
+
         logger.log(
             projectId,
             PipelineStatus.EXPORTING,
-            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${fullyCalibratedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${fullyCalibratedBlurSpecs.size} | PurgeSourceAudio=true",
+            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${remappedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | PurgeSourceAudio=true",
             LogSeverity.INFO
         )
 
@@ -891,10 +893,10 @@ class VideoProcessingPipeline(
             targetAspectRatio = if (recipe.audioOnlyMode) "ORIGINAL" else (recipe.projectInfo?.targetAspectRatio ?: project.targetAspectRatio),
             zoomScale = if (recipe.audioOnlyMode) 1.0f else (recipe.editingPlan.zoom?.scale ?: 1.0f),
             speedRamps = speedSpecs,
-            blurSpecs = fullyCalibratedBlurSpecs,
+            blurSpecs = remappedBlurSpecs,
             replacementOverlays = remappedReplacementOverlays,
             colorGrade = colorGradeSpec,
-            trackingIndicators = fullyCalibratedTrackingIndicators,
+            trackingIndicators = remappedTrackingIndicators,
             textCards = remappedTextCards,
             videoWidth = project.metadata.width,
             videoHeight = project.metadata.height
