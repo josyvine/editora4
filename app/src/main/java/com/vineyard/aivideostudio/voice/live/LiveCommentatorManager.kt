@@ -2,6 +2,7 @@ package com.vineyard.aivideostudio.voice.live
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
@@ -14,6 +15,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.vineyard.aivideostudio.ai.model.ModelPurpose
 import com.vineyard.aivideostudio.core.common.DispatcherProvider
+import com.vineyard.aivideostudio.core.model.effects.NormalizedBounds
 import com.vineyard.aivideostudio.core.result.AppError
 import com.vineyard.aivideostudio.core.result.AppResult
 import com.vineyard.aivideostudio.data.preferences.Preferences
@@ -23,9 +25,12 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Manages the headless background WebView runtime that connects to the Gemini Multimodal Live API.
@@ -52,6 +57,10 @@ class LiveCommentatorManager(
     private var commentaryDeferred: CompletableDeferred<AppResult<File>>? = null
     private val isSessionActive = AtomicBoolean(false)
     private var currentSessionModelId: String? = null
+
+    // Deferred handler for Live WebSocket Vision Target Grounding
+    private var visionDeferred: CompletableDeferred<AppResult<NormalizedBounds>>? = null
+    private var pendingVisionTargetId: String? = null
 
     fun setModelRepository(repo: ModelRepositoryImpl) {
         this.modelRepository = repo
@@ -138,6 +147,16 @@ class LiveCommentatorManager(
 
                             override fun onDiagnostic(message: String, category: String) {
                                 Log.d("LiveDiagnostic[$category]", message)
+                            }
+
+                            override fun onTargetCoordinatesReceived(
+                                targetId: String,
+                                left: Float,
+                                top: Float,
+                                right: Float,
+                                bottom: Float
+                            ) {
+                                handleTargetCoordinatesReceived(targetId, left, top, right, bottom)
                             }
                         }
                     ),
@@ -234,6 +253,85 @@ class LiveCommentatorManager(
     }
 
     /**
+     * Streams a single video frame over the persistent Gemini Live WebSocket to accurately ground
+     * physical objects or faces (100% Live Streaming - Zero REST calls).
+     */
+    suspend fun groundTargetWithLiveVision(
+        frameBitmap: Bitmap,
+        targetId: String,
+        targetDescription: String
+    ): AppResult<NormalizedBounds> = withContext(dispatcherProvider.io) {
+        if (!isWebViewReady.get() || webView == null) {
+            val initResult = initialize()
+            if (initResult is AppResult.Error) {
+                return@withContext AppResult.Error(initResult.error)
+            }
+        }
+
+        val deferred = CompletableDeferred<AppResult<NormalizedBounds>>()
+        visionDeferred = deferred
+        pendingVisionTargetId = targetId
+
+        // Compress frame to Base64 JPEG for WebSocket transport
+        val base64Jpg = try {
+            val baos = ByteArrayOutputStream()
+            frameBitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+            val bytes = baos.toByteArray()
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            visionDeferred = null
+            pendingVisionTargetId = null
+            return@withContext AppResult.Error(AppError.MediaProcessingError("Failed encoding video frame for Live Vision: ${e.message}"))
+        }
+
+        withContext(dispatcherProvider.main) {
+            val escapedDesc = escapeForJavascript(targetDescription)
+            val escapedId = escapeForJavascript(targetId)
+            val jsCall = "window.groundTargetWithVision('$base64Jpg', '$escapedId', '$escapedDesc');"
+            webView?.evaluateJavascript(jsCall, null)
+        }
+
+        val result = withTimeoutOrNull(20_000L) {
+            deferred.await()
+        } ?: AppResult.Error(AppError.NetworkError("Gemini Live Vision grounding timed out after 20s for target '$targetId'."))
+
+        visionDeferred = null
+        pendingVisionTargetId = null
+        result
+    }
+
+    /**
+     * Dispatches visual coordinates received from Gemini Live Tool Calling into the waiting coroutine.
+     */
+    private fun handleTargetCoordinatesReceived(
+        targetId: String,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float
+    ) {
+        Log.i(TAG, "🎯 [LIVE-VISION] Coordinates received for '$targetId': L:$left, T:$top, R:$right, B:$bottom")
+
+        val safeLeft = min(left, right).coerceIn(0.0f, 0.99f)
+        val safeRight = max(left, right).coerceIn(safeLeft + 0.01f, 1.0f)
+        val safeTop = min(top, bottom).coerceIn(0.0f, 0.99f)
+        val safeBottom = max(top, bottom).coerceIn(safeTop + 0.01f, 1.0f)
+
+        val normalizedBounds = NormalizedBounds(
+            left = safeLeft,
+            top = safeTop,
+            right = safeRight,
+            bottom = safeBottom
+        )
+
+        visionDeferred?.let { def ->
+            if (def.isActive) {
+                def.complete(AppResult.Success(normalizedBounds))
+            }
+        }
+    }
+
+    /**
      * Appends incoming decoded Base64 PCM audio bytes directly into the open output file.
      */
     private fun handleIncomingAudioChunk(base64PcmData: String) {
@@ -288,6 +386,13 @@ class LiveCommentatorManager(
                 def.complete(AppResult.Error(AppError.MediaProcessingError("Live commentary engine error: $errorMessage")))
             }
         }
+
+        visionDeferred?.let { def ->
+            if (def.isActive) {
+                def.complete(AppResult.Error(AppError.MediaProcessingError("Live vision grounding error: $errorMessage")))
+            }
+        }
+
         isSessionActive.set(false)
     }
 
@@ -358,9 +463,9 @@ class LiveCommentatorManager(
 
                 // 3. Check preferences flow
                 val configuredModel = preferences.selectedLiveModel.first()
-                if (configuredModel.isNotBlank()) cleanModelId(configuredModel) else "models/gemini-2.5-flash-native-audio-preview-12-2025"
+                if (configuredModel.isNotBlank()) cleanModelId(configuredModel) else "models/gemini-3.8-live"
             } catch (_: Exception) {
-                "models/gemini-2.5-flash-native-audio-preview-12-2025"
+                "models/gemini-3.8-live"
             }
         }
     }
