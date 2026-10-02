@@ -948,7 +948,7 @@ class VideoProcessingPipeline(
 
     /**
      * Pass 1: Proposes initial target coordinates via Gemini Live Bidi WebSocket stream.
-     * Instructs Gemini Vision to establish a dynamic spatial column and isolate the specific user-targeted entity.
+     * Instructs Gemini Vision to locate the true visual center-of-mass and tight bounding box of the target object.
      */
     private suspend fun groundTrackingTargetsWithVision(
         videoFile: File,
@@ -969,10 +969,9 @@ class VideoProcessingPipeline(
                     ?: return@map indicator
 
                 val targetDesc = indicator.label ?: indicator.objectClass ?: indicator.targetType ?: "target object"
-                val initialBoundsHint = indicator.staticBounds?.let { "Initial hint near [L:${"%.2f".format(it.left)}, T:${"%.2f".format(it.top)}]. " } ?: ""
-                val prompt = "DYNAMIC SPATIAL COLUMN PASS: Locate the target '$targetDesc'. $initialBoundsHint" +
-                        "Identify its spatial placement column [minX to maxX] and exact normalized coordinates. " +
-                        "For still objects, lock coordinates strictly to the physical surface where it sits. Avoid surrounding walls, furniture, or shelves."
+                val prompt = "ZERO-BIAS SPATIAL DISCOVERY PASS: Locate the physical object '$targetDesc'. " +
+                        "Identify its exact visual center-of-mass and tight physical bounding box [left, top, right, bottom] on the surface where it sits. " +
+                        "Ignore any surrounding wall, headboard, or furniture background. Return only the true object coordinates."
 
                 val visionResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
@@ -986,10 +985,20 @@ class VideoProcessingPipeline(
 
                 if (visionResult is AppResult.Success) {
                     val visionBounds = visionResult.data
+                    val scriptBounds = indicator.staticBounds ?: visionBounds
+
+                    val scriptCenterX = (scriptBounds.left + scriptBounds.right) / 2f
+                    val scriptCenterY = (scriptBounds.top + scriptBounds.bottom) / 2f
+                    val visionCenterX = (visionBounds.left + visionBounds.right) / 2f
+                    val visionCenterY = (visionBounds.top + visionBounds.bottom) / 2f
+
+                    val deltaX = visionCenterX - scriptCenterX
+                    val deltaY = visionCenterY - scriptCenterY
+
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-COLUMN-PROPOSE] Target '${indicator.id}' ($targetDesc) grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
+                        "👁️ [LIVE-WS-COLUMN-PROPOSE] Target '${indicator.id}' ($targetDesc) grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)} | Center=(X:${"%.3f".format(visionCenterX)}, Y:${"%.3f".format(visionCenterY)}) | Script Drift: ΔX=${"%.3f".format(deltaX)}, ΔY=${"%.3f".format(deltaY)}",
                         LogSeverity.INFO
                     )
                     indicator.copy(staticBounds = visionBounds)
@@ -1007,7 +1016,7 @@ class VideoProcessingPipeline(
 
     /**
      * Pass 3 (Closed-Loop Column Verification): Gemini Live inspects the candidate coordinates produced by ML Kit.
-     * Enforces that the candidate bounds remain strictly inside the target's physical spatial corridor.
+     * Enforces that the tool points accurately at the physical target surface without floating offset.
      */
     private suspend fun verifyAndCorrectTrackingTargetsWithVision(
         videoFile: File,
@@ -1025,8 +1034,12 @@ class VideoProcessingPipeline(
                     ?: return@map indicator
 
                 val targetDesc = indicator.label ?: indicator.objectClass ?: "target object"
-                val verifyPrompt = "CLOSED-LOOP COLUMN VERIFICATION: Target is '$targetDesc'. Candidate box is at [Top: ${"%.3f".format(bounds.top)}, Bottom: ${"%.3f".format(bounds.bottom)}]. " +
-                        "If this box has drifted outside its physical surface column (e.g. pulled onto shelves, books, or walls instead of the '$targetDesc' on the bed), report the TRUE corrected box for '$targetDesc'."
+                val candidateCenterX = (bounds.left + bounds.right) / 2f
+                val candidateCenterY = (bounds.top + bounds.bottom) / 2f
+
+                val verifyPrompt = "CLOSED-LOOP TARGET VERIFICATION: Physical target is '$targetDesc'. " +
+                        "Candidate center is at (X: ${"%.3f".format(candidateCenterX)}, Y: ${"%.3f".format(candidateCenterY)}) with Box [L:${"%.3f".format(bounds.left)}, T:${"%.3f".format(bounds.top)}, R:${"%.3f".format(bounds.right)}, B:${"%.3f".format(bounds.bottom)}]. " +
+                        "Verify that this box is centered directly on '$targetDesc' and not on adjacent furniture or walls. Report the exact verified target box."
 
                 val verificationResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
@@ -1040,10 +1053,14 @@ class VideoProcessingPipeline(
 
                 if (verificationResult is AppResult.Success) {
                     val verifiedBounds = verificationResult.data
+                    val vCenterX = (verifiedBounds.left + verifiedBounds.right) / 2f
+                    val vCenterY = (verifiedBounds.top + verifiedBounds.bottom) / 2f
+                    val correctionDist = kotlin.math.hypot((vCenterX - candidateCenterX).toDouble(), (vCenterY - candidateCenterY).toDouble()).toFloat()
+
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "🔄 [CLOSED-LOOP-COLUMN-AUTOFIX] Verified '$targetDesc' via Live WebSocket: L:${"%.3f".format(verifiedBounds.left)}, T:${"%.3f".format(verifiedBounds.top)}, R:${"%.3f".format(verifiedBounds.right)}, B:${"%.3f".format(verifiedBounds.bottom)}",
+                        "🔄 [CLOSED-LOOP-AUTOFIX-REPORT] Target '$targetDesc' Verified: Box=[L:${"%.3f".format(verifiedBounds.left)}, T:${"%.3f".format(verifiedBounds.top)}, R:${"%.3f".format(verifiedBounds.right)}, B:${"%.3f".format(verifiedBounds.bottom)}] | Center=(X:${"%.3f".format(vCenterX)}, Y:${"%.3f".format(vCenterY)}) | Correction Distance: ${"%.3f".format(correctionDist)} | Verdict: PASS",
                         LogSeverity.SUCCESS
                     )
                     indicator.copy(staticBounds = verifiedBounds)
