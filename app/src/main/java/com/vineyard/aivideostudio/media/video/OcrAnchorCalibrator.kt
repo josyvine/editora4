@@ -25,12 +25,13 @@ import kotlin.math.hypot
 object OcrAnchorCalibrator {
 
     private const val TAG = "OcrAnchorCalibrator"
-    private const val MAX_SEARCH_RADIUS_NORMALIZED = 0.35f // Max search radius around target zone
+    private const val MAX_SEARCH_RADIUS_NORMALIZED = 0.38f // Search radius around target zone
+    private const val STRIDE_STEP_MS = 400L // 400ms temporal stride step across active window
 
     /**
      * Universally calibrates tracking indicators for any video:
-     * 1. Inspects settled video frames across the trigger window to avoid animation blur.
-     * 2. Finds matching text lines with strict regional and token gating.
+     * 1. Inspects video frames using dynamic stride scanning across the entire active window.
+     * 2. Finds matching text lines with robust token and numeric clustering.
      * 3. Snaps bounding boxes directly to real UI targets with zero human script editing.
      * 4. Dispatches full real-time diagnostic telemetry to the in-app log console.
      */
@@ -94,16 +95,21 @@ object OcrAnchorCalibrator {
 
                 val durationMs = (indicator.endTimeMs - indicator.startTimeMs).coerceAtLeast(0L)
 
-                // Multi-Frame Temporal Settling:
-                // Check settled moments (+400ms, +0ms, +800ms) to allow menus/drawers to finish animating
-                val sampleOffsetsMs = when {
-                    durationMs >= 1500L -> listOf(
-                        minOf(450L, durationMs / 2L),  // Priority 1: Settled frame after animation
-                        0L,                             // Priority 2: Trigger start frame
-                        minOf(900L, durationMs * 2 / 3) // Priority 3: Deep window fallback
-                    )
-                    durationMs >= 600L -> listOf(durationMs / 2L, 0L)
-                    else -> listOf(0L)
+                // Full-Window Stride Scanning: Generate 400ms stride offsets across the ENTIRE duration
+                val sampleOffsetsMs = mutableListOf<Long>()
+                
+                // Priority 1: Settled frame offset (+400ms) to bypass animations
+                if (durationMs >= 600L) {
+                    sampleOffsetsMs.add(minOf(400L, durationMs / 2L))
+                }
+                
+                // Priority 2: Stride forward across the whole window
+                var cursorOffset = 0L
+                while (cursorOffset <= durationMs) {
+                    if (!sampleOffsetsMs.contains(cursorOffset)) {
+                        sampleOffsetsMs.add(cursorOffset)
+                    }
+                    cursorOffset += STRIDE_STEP_MS
                 }
 
                 val hintCenterX = indicator.staticBounds?.centerX ?: 0.5f
@@ -143,7 +149,7 @@ object OcrAnchorCalibrator {
                     if (rect != null) {
                         matchedRect = rect
                         matchedSampleMs = sampleTimeMs
-                        break // Found high-confidence match on settled frame
+                        break // First-match lock anywhere inside the window
                     }
                 }
 
@@ -168,7 +174,7 @@ object OcrAnchorCalibrator {
                     val deltaY = snappedTop - scriptTop
                     val offsetUsed = matchedSampleMs - indicator.startTimeMs
 
-                    val logMsg = "🎯 [OCR_AUTOFIX] Snapped '${indicator.id}' ['$anchorQuery'] on Settled Frame at ${matchedSampleMs}ms (+${offsetUsed}ms): " +
+                    val logMsg = "🎯 [OCR_AUTOFIX] Snapped '${indicator.id}' ['$anchorQuery'] on Stride Frame at ${matchedSampleMs}ms (+${offsetUsed}ms): " +
                             "Script Y=${"%.2f".format(scriptTop)} -> Real Text Y=${"%.2f".format(snappedTop)} (ΔY=${"%.2f".format(deltaY)})"
 
                     Log.i(TAG, logMsg)
@@ -200,7 +206,7 @@ object OcrAnchorCalibrator {
                         logger.log(
                             projectId,
                             PipelineStatus.EXPORTING,
-                            "Anchor text '$anchorQuery' not detected across settled window near (X:${"%.2f".format(hintCenterX)}, Y:${"%.2f".format(hintCenterY)}), retaining script bounds [T=${"%.2f".format(indicator.staticBounds?.top ?: 0f)}]",
+                            "Anchor text '$anchorQuery' not detected across ${sampleOffsetsMs.size} stride frame(s), retaining script bounds [T=${"%.2f".format(indicator.staticBounds?.top ?: 0f)}]",
                             LogSeverity.INFO
                         )
                     }
@@ -231,8 +237,7 @@ object OcrAnchorCalibrator {
 
     /**
      * Finds the closest matching text element with priority given to individual lines first,
-     * preventing whole multi-row blocks from being mistakenly highlighted.
-     * Enforces strict spatial proximity and numeric token isolation.
+     * supporting decoupled version numbers and token clusters in dense monospace code.
      */
     private fun findBestMatchingBlock(
         ocrText: Text?,
@@ -264,7 +269,7 @@ object OcrAnchorCalibrator {
                 val lineNormCenterY = lineBox.exactCenterY() / frameHeight
 
                 // Strict Regional Guard: If target is a bottom action button, ignore text in top/middle screen
-                if (isBottomActionTarget && lineNormCenterY < 0.75f) {
+                if (isBottomActionTarget && lineNormCenterY < 0.72f) {
                     continue
                 }
 
@@ -275,10 +280,12 @@ object OcrAnchorCalibrator {
 
                 val lineText = line.text.lowercase().trim()
 
-                // If query specifies numbers (e.g. "3.1" or "3.5"), require them on the line
+                // Robust Number Check: Match exact version (e.g. "3.1") OR decoupled digits ("3" and "1")
                 if (requiredNumberTokens.isNotEmpty()) {
-                    val hasAllNumbers = requiredNumberTokens.all { lineText.contains(it) }
-                    if (!hasAllNumbers) {
+                    val hasNumericMatch = requiredNumberTokens.all { numToken ->
+                        lineText.contains(numToken) || (numToken.contains(".") && numToken.split(".").all { lineText.contains(it) })
+                    }
+                    if (!hasNumericMatch) {
                         continue
                     }
                 }
@@ -295,12 +302,12 @@ object OcrAnchorCalibrator {
                     continue
                 }
 
-                // Keyword overlap match on line
+                // Keyword overlap match on line (relaxed to 40% for lines with numbering/pipes)
                 val keywordMatches = queryKeywords.count { lineText.contains(it) }
                 if (keywordMatches > 0) {
                     val matchRatio = keywordMatches.toFloat() / queryKeywords.size.coerceAtLeast(1)
-                    if (matchRatio >= 0.5f) {
-                        val score = (matchRatio * 2.0f) + (proximityBonus * 1.5f)
+                    if (matchRatio >= 0.40f) {
+                        val score = (matchRatio * 2.2f) + (proximityBonus * 1.5f)
                         if (score > bestScore) {
                             bestScore = score
                             bestRect = lineBox
@@ -320,7 +327,7 @@ object OcrAnchorCalibrator {
             val blockNormCenterX = blockBox.exactCenterX() / frameWidth
             val blockNormCenterY = blockBox.exactCenterY() / frameHeight
 
-            if (isBottomActionTarget && blockNormCenterY < 0.75f) {
+            if (isBottomActionTarget && blockNormCenterY < 0.72f) {
                 continue
             }
 
@@ -332,8 +339,10 @@ object OcrAnchorCalibrator {
             val unifiedBlockText = block.text.replace("\n", " ").lowercase()
 
             if (requiredNumberTokens.isNotEmpty()) {
-                val hasAllNumbers = requiredNumberTokens.all { unifiedBlockText.contains(it) }
-                if (!hasAllNumbers) {
+                val hasNumericMatch = requiredNumberTokens.all { numToken ->
+                    unifiedBlockText.contains(numToken) || (numToken.contains(".") && numToken.split(".").all { unifiedBlockText.contains(it) })
+                }
+                if (!hasNumericMatch) {
                     continue
                 }
             }
