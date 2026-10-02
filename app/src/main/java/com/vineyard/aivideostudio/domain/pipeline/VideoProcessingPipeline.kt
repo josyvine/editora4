@@ -99,7 +99,7 @@ class VideoProcessingPipeline(
         }
 
         // =========================================================================
-        // AUTO MODE (Strictly single/sequential execution)
+        // AUTO MODE (Strictly single/sequential execution - 100% UNTOUCHED)
         // =========================================================================
         val videoMetadataReader = VideoMetadataReader(context)
         logger.log(projectId, PipelineStatus.SOURCE_ANALYSIS, "Starting Auto AI Video Studio pipeline for ${project.name}")
@@ -794,38 +794,49 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (With Dynamic Column Grounding + Local ML Kit Snap)
+        // 7. FINAL PRODUCTION EXPORT (Target-Isolated Calibration + Media3 Hardware Shaders)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
-        // Auto-Fix 1: OCR Text Calibration (Existing UI Text Snapping - 100% untouched)
-        val calibratedTrackingIndicators = try {
-            OcrAnchorCalibrator.calibrateIndicators(
-                context = context,
-                videoUri = Uri.parse(currentVideoUri),
-                indicators = remappedTrackingIndicators,
-                videoWidth = project.metadata.width,
-                videoHeight = project.metadata.height,
-                logger = logger,
-                projectId = projectId
-            )
-        } catch (e: Exception) {
-            logger.log(
-                projectId,
-                PipelineStatus.EXPORTING,
-                "OCR Anchor auto-fix skipped: ${e.message}",
-                LogSeverity.WARNING
-            )
-            remappedTrackingIndicators
+        // Auto-Fix 1: OCR Text Calibration (ONLY for explicit OCR typography targets)
+        val (ocrIndicators, nonOcrIndicators) = remappedTrackingIndicators.partition { indicator ->
+            indicator.targetType.equals("ocr_text", ignoreCase = true) ||
+            indicator.targetType.equals("text", ignoreCase = true)
         }
 
-        // Auto-Fix 2: Multimodal Gemini Live WebSocket Vision -> Dynamic Spatial Column Grounding
+        val calibratedOcrIndicators = if (ocrIndicators.isNotEmpty()) {
+            try {
+                OcrAnchorCalibrator.calibrateIndicators(
+                    context = context,
+                    videoUri = Uri.parse(currentVideoUri),
+                    indicators = ocrIndicators,
+                    videoWidth = project.metadata.width,
+                    videoHeight = project.metadata.height,
+                    logger = logger,
+                    projectId = projectId
+                )
+            } catch (e: Exception) {
+                logger.log(
+                    projectId,
+                    PipelineStatus.EXPORTING,
+                    "OCR Anchor auto-fix skipped: ${e.message}",
+                    LogSeverity.WARNING
+                )
+                ocrIndicators
+            }
+        } else {
+            emptyList()
+        }
+
+        // Combine OCR-calibrated targets and non-OCR object targets
+        val combinedIndicators = calibratedOcrIndicators + nonOcrIndicators
+
         val videoFileForCalibration = runCatching {
             val uri = Uri.parse(currentVideoUri)
             if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
         }.getOrNull() ?: File(currentVideoUri)
 
-        // Pass 1: Establish Dynamic Spatial Columns and initial grounded proposal via Gemini Live WebSocket
+        // Pass 1: Establish Target-Isolated Dynamic Spatial Columns via Gemini Live WebSocket
         val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
             videoFile = videoFileForCalibration,
             blurSpecs = remappedBlurSpecs
@@ -833,7 +844,7 @@ class VideoProcessingPipeline(
 
         val visionGroundedTrackingIndicators = groundTrackingTargetsWithVision(
             videoFile = videoFileForCalibration,
-            indicators = calibratedTrackingIndicators
+            indicators = combinedIndicators
         )
 
         // Pass 2: Local ML Kit applies physical contour snapping + multi-slice dynamic motion tracking across timeline
@@ -937,7 +948,7 @@ class VideoProcessingPipeline(
 
     /**
      * Pass 1: Proposes initial target coordinates via Gemini Live Bidi WebSocket stream.
-     * Instructs Gemini Vision to establish a dynamic spatial column and isolate the object on its surface.
+     * Instructs Gemini Vision to establish a dynamic spatial column and isolate the specific user-targeted entity.
      */
     private suspend fun groundTrackingTargetsWithVision(
         videoFile: File,
@@ -958,7 +969,8 @@ class VideoProcessingPipeline(
                     ?: return@map indicator
 
                 val targetDesc = indicator.label ?: indicator.objectClass ?: indicator.targetType ?: "target object"
-                val prompt = "DYNAMIC SPATIAL COLUMN PASS: Locate the target '$targetDesc'. " +
+                val initialBoundsHint = indicator.staticBounds?.let { "Initial hint near [L:${"%.2f".format(it.left)}, T:${"%.2f".format(it.top)}]. " } ?: ""
+                val prompt = "DYNAMIC SPATIAL COLUMN PASS: Locate the target '$targetDesc'. $initialBoundsHint" +
                         "Identify its spatial placement column [minX to maxX] and exact normalized coordinates. " +
                         "For still objects, lock coordinates strictly to the physical surface where it sits. Avoid surrounding walls, furniture, or shelves."
 
@@ -1047,6 +1059,9 @@ class VideoProcessingPipeline(
         }
     }
 
+    /**
+     * Pass 1 (Blur Targets): Establishes distinct spatial columns per target without cross-subject collision.
+     */
     private suspend fun groundBlurTargetsWithVision(
         videoFile: File,
         blurSpecs: List<BlurSpec>
@@ -1067,7 +1082,8 @@ class VideoProcessingPipeline(
 
                 val targetId = "blur_${spec.targetType}_$idx"
                 val targetDesc = spec.targetType ?: "face"
-                val prompt = "DYNAMIC MOTION COLUMN PASS: Locate the '$targetDesc' and define its horizontal motion column [minX to maxX] across the frame."
+                val initialPosHint = "Initial region near Left=${"%.2f".format(spec.bounds.left)}, Top=${"%.2f".format(spec.bounds.top)}"
+                val prompt = "DYNAMIC MOTION COLUMN PASS: Locate the specific '$targetDesc' ($initialPosHint) and define its distinct horizontal motion column [minX to maxX] across the frame."
 
                 val visionResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
@@ -1084,7 +1100,7 @@ class VideoProcessingPipeline(
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-COLUMN-BLUR] Blur target '${spec.targetType}' column grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
+                        "👁️ [LIVE-WS-COLUMN-BLUR] Blur target '$targetId' ($targetDesc) column grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
                         LogSeverity.INFO
                     )
                     spec.copy(bounds = visionBounds)
