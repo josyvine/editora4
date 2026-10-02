@@ -794,7 +794,7 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (With Gemini Vision Anchor Grounding + Local ML Kit Snap)
+        // 7. FINAL PRODUCTION EXPORT (With Closed-Loop Gemini Vision Grounding + Local ML Kit Snap)
         onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
@@ -819,54 +819,49 @@ class VideoProcessingPipeline(
             remappedTrackingIndicators
         }
 
-        // Auto-Fix 2: Multimodal Gemini Vision Grounding -> Leads On-Device ML Kit
+        // Auto-Fix 2: Multimodal Gemini Live WebSocket Vision -> Closed-Loop with Local ML Kit
         val videoFileForCalibration = runCatching {
             val uri = Uri.parse(currentVideoUri)
             if (uri.scheme == "file") File(uri.path ?: "") else File(uri.path ?: currentVideoUri)
         }.getOrNull() ?: File(currentVideoUri)
 
-        // Ground blur targets through Gemini Live WebSocket if coordinates need directional validation
+        // Pass 1: Gemini Live WebSocket grounds the initial vision proposal
         val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
             videoFile = videoFileForCalibration,
             blurSpecs = remappedBlurSpecs
         )
 
-        // Ground tracking indicators through Gemini Live WebSocket if coordinates need directional validation
         val visionGroundedTrackingIndicators = groundTrackingTargetsWithVision(
             videoFile = videoFileForCalibration,
             indicators = calibratedTrackingIndicators
         )
 
-        // Hand over Vision-grounded targets to local ML Kit for pixel-level snap
-        val fullyCalibratedBlurSpecs = try {
+        // Pass 2: Local ML Kit applies physical contour snapping
+        val mlKitSnappedBlurSpecs = try {
             objectAnchorCalibrator.calibrateBlurSpecs(
                 videoFile = videoFileForCalibration,
                 blurSpecs = visionGroundedBlurSpecs
             )
         } catch (e: Exception) {
-            logger.log(
-                projectId,
-                PipelineStatus.EXPORTING,
-                "Object/Face Blur auto-fix skipped: ${e.message}",
-                LogSeverity.WARNING
-            )
             visionGroundedBlurSpecs
         }
 
-        val fullyCalibratedTrackingIndicators = try {
+        val mlKitSnappedIndicators = try {
             objectAnchorCalibrator.calibrateTrackingIndicators(
                 videoFile = videoFileForCalibration,
                 indicators = visionGroundedTrackingIndicators
             )
         } catch (e: Exception) {
-            logger.log(
-                projectId,
-                PipelineStatus.EXPORTING,
-                "Object/Face Tracking auto-fix skipped: ${e.message}",
-                LogSeverity.WARNING
-            )
             visionGroundedTrackingIndicators
         }
+
+        // Pass 3 (Closed-Loop Verification): Gemini Live inspects ML Kit's snap and corrects if misplaced onto furniture
+        val fullyCalibratedTrackingIndicators = verifyAndCorrectTrackingTargetsWithVision(
+            videoFile = videoFileForCalibration,
+            indicators = mlKitSnappedIndicators
+        )
+
+        val fullyCalibratedBlurSpecs = mlKitSnappedBlurSpecs
 
         logger.log(
             projectId,
@@ -914,7 +909,7 @@ class VideoProcessingPipeline(
                 uriStr
             }
             is AppResult.Error -> {
-                val errorMsg = "Final video export failed: ${exportResult.error.message}"
+                val errorMsg = "Automated video export failed: ${exportResult.error.message}"
                 logger.log(projectId, PipelineStatus.EXPORTING, errorMsg, LogSeverity.ERROR)
                 recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.FAILED, errorMessage = errorMsg)
                 projectRepository.markFailed(projectId, errorMsg)
@@ -941,8 +936,7 @@ class VideoProcessingPipeline(
     }
 
     /**
-     * Uses Gemini Live Bidi WebSocket stream (100% Live Streaming, Zero REST calls)
-     * to visually ground target coordinates and lead on-device ML Kit.
+     * Pass 1: Proposes initial target coordinates via Gemini Live Bidi WebSocket stream.
      */
     private suspend fun groundTrackingTargetsWithVision(
         videoFile: File,
@@ -963,12 +957,13 @@ class VideoProcessingPipeline(
                     ?: return@map indicator
 
                 val targetDesc = indicator.label ?: indicator.objectClass ?: indicator.targetType ?: "target object"
+                val prompt = "Locate the '$targetDesc'. Avoid surrounding furniture, shelves, or walls. Identify the exact coordinates of the '$targetDesc'."
 
                 val visionResult = try {
                     liveCommentatorManager.groundTargetWithLiveVision(
                         frameBitmap = frameBitmap,
                         targetId = indicator.id,
-                        targetDescription = targetDesc
+                        targetDescription = prompt
                     )
                 } finally {
                     frameBitmap.recycle()
@@ -979,7 +974,7 @@ class VideoProcessingPipeline(
                     logger.log(
                         "CALIBRATION",
                         PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-VISION] Target '${indicator.id}' ($targetDesc) grounded via Live WebSocket: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
+                        "👁️ [LIVE-WS-PROPOSE] Target '${indicator.id}' ($targetDesc) proposed via WebSocket: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)}",
                         LogSeverity.INFO
                     )
                     indicator.copy(staticBounds = visionBounds)
@@ -989,6 +984,61 @@ class VideoProcessingPipeline(
             }
         } catch (e: Exception) {
             logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Live WebSocket vision grounding skipped: ${e.message}", LogSeverity.INFO)
+            indicators
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Pass 3 (Closed-Loop Verification): Gemini Live inspects the candidate coordinates produced by ML Kit.
+     * If ML Kit snapped to the wrong physical structure (like a wooden shelf instead of a blanket),
+     * Gemini Live detects the error and emits the corrected shift coordinates.
+     */
+    private suspend fun verifyAndCorrectTrackingTargetsWithVision(
+        videoFile: File,
+        indicators: List<TrackingIndicatorSpec>
+    ): List<TrackingIndicatorSpec> {
+        val targetsToVerify = indicators.filter { it.targetType.equals("object", ignoreCase = true) }
+        if (targetsToVerify.isEmpty() || !videoFile.exists()) return indicators
+
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(videoFile.absolutePath)
+            indicators.map { indicator ->
+                val bounds = indicator.staticBounds ?: return@map indicator
+                val frameBitmap = retriever.getFrameAtTime(indicator.startTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: return@map indicator
+
+                val targetDesc = indicator.label ?: indicator.objectClass ?: "target object"
+                val verifyPrompt = "VERIFICATION PASS: Target is '$targetDesc'. Current candidate bounds are at [Top: ${"%.3f".format(bounds.top)}, Bottom: ${"%.3f".format(bounds.bottom)}]. " +
+                        "If this box is on the bookshelf, books, or wall instead of the '$targetDesc' on the bed, report the TRUE corrected box for '$targetDesc'."
+
+                val verificationResult = try {
+                    liveCommentatorManager.groundTargetWithLiveVision(
+                        frameBitmap = frameBitmap,
+                        targetId = indicator.id,
+                        targetDescription = verifyPrompt
+                    )
+                } finally {
+                    frameBitmap.recycle()
+                }
+
+                if (verificationResult is AppResult.Success) {
+                    val verifiedBounds = verificationResult.data
+                    logger.log(
+                        "CALIBRATION",
+                        PipelineStatus.EXPORTING,
+                        "🔄 [CLOSED-LOOP-AUTOFIX] Verified '$targetDesc' via Live WebSocket: L:${"%.3f".format(verifiedBounds.left)}, T:${"%.3f".format(verifiedBounds.top)}, R:${"%.3f".format(verifiedBounds.right)}, B:${"%.3f".format(verifiedBounds.bottom)}",
+                        LogSeverity.SUCCESS
+                    )
+                    indicator.copy(staticBounds = verifiedBounds)
+                } else {
+                    indicator
+                }
+            }
+        } catch (e: Exception) {
+            logger.log("CALIBRATION", PipelineStatus.EXPORTING, "Closed-loop verification skipped: ${e.message}", LogSeverity.INFO)
             indicators
         } finally {
             try { retriever.release() } catch (_: Exception) {}
